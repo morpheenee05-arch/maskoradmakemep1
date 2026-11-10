@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Chrome profiles (session data — never commit)
+.chrome_profile_*/
+.uc_driver_cache/
+# Profile backups produced by tools/backup_profiles.ps1
+profile_backups/
+
+# Browser/driver binaries — fetched per-server, not versioned (keep repo lean)
+*.zip
+*.zip.*
+chromedriver-win64/
+chromedriver-linux64/
+chrome-linux64/
+uc_driver
+undetected_chromedriver
+driver/
+
+# Logs
+*.log
+
+# Screenshots / debug artifacts
+*.png
+*.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test output
+test_results.txt
+full_test_results.txt
+
+# OS
+Thumbs.db
+.DS_Store
+
+# TTS cache (generated at runtime)
+storage/tts_cache/
+
+# On-agent account-wipe archive (screenshots + reasons)
+wipe_history/
+
+# Cached Google account credentials (GV_SAVE_CREDENTIALS=1) — never commit
+storage/gv_accounts.json
+
+# Archives / local packaging
+*.7z
+
+# Runtime state & per-server data (never version, never wipe on update)
+logs/
+profiles/
+.tmp_uc_probe*/
+chrome-win64*/
+storage/prompts.json
+storage/script_templates.json
+storage/bot_settings.json
+storage/.update_applied

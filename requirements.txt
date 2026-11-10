@@ -1,0 +1,38 @@
+# Pinned for reproducible RDP/server deploys.
+# Versions verified against a working interpreter (Python 3.13).
+# NOTE: deepgram-sdk and soxr were not present in the verification env —
+# they keep a version floor; pin them from your actual runtime once known
+# (run:  python -m pip freeze | findstr /I "deepgram-sdk soxr").
+
+# Core
+python-telegram-bot[job-queue]==22.5
+python-dotenv==1.2.1
+
+aiofiles==25.1.0
+loguru==0.7.3
+
+rich==15.0.0
+
+# Deepgram Voice Agent API
+deepgram-sdk>=5.0.0
+websockets==16.0
+aiohttp>=3.10.0
+
+# Audio
+sounddevice==0.5.5
+soxr>=1.0.0
+
+# Distributed mode (controller/agent bus) — only needed when NODE_ROLE!=standalone
+redis>=5.0.0
+
+# Telephony automation
+selenium==4.15.2
+undetected-chromedriver==3.5.5
+webdriver-manager==4.0.2
+
+# Chrome memory guard: per-worker RSS accounting + reaping orphaned browsers.
+# Optional at runtime (the guard falls back to JS-heap + call counters), but
+# strongly recommended on agents.
+psutil>=5.9.0
+
+setuptools==82.0.1
