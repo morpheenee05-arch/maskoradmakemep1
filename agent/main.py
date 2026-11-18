@@ -162,6 +162,173 @@ async def _handle_wipe_history_job(pool, bus, job: dict):
     logger.info(f"[job {job_id}] wipe history sent ({len(events)} event(s))")
 
 
+async def _handle_sip_test_job(pool, bus, job: dict):
+    """SIP backend test: cookies from a live worker Chrome → mint SIP creds →
+    REGISTER (+ optional test call), streaming progress to the controller."""
+    import json as _json
+
+    job_id = job.get("job_id")
+    aid = config.AGENT_ID
+    params = job.get("params") or {}
+    call_number = str(params.get("call") or "").strip()
+    hold = max(5, min(120, int(params.get("hold") or 25)))
+    want_worker = params.get("worker")
+
+    async def progress(stage: str, line: str):
+        try:
+            await bus.publish_result({
+                "job_id": job_id, "agent_id": aid, "kind": "sip_progress",
+                "stage": stage, "line": line,
+            })
+        except Exception:
+            pass
+
+    stages: dict = {}
+    events: list = []
+    error = None
+    phone = None
+    try:
+        # ── 1. pick a worker with a live, signed-in Chrome ──
+        worker = None
+        if want_worker is not None:
+            worker = pool._worker_by_selector(worker=int(want_worker))
+        else:
+            for w in pool.workers:
+                if w.driver is not None and w.is_authenticated:
+                    worker = w
+                    break
+        if worker is None or worker.driver is None:
+            raise RuntimeError(
+                "no signed-in worker with a live Chrome on this agent")
+        stages["worker"] = {
+            "worker_id": worker.worker_id,
+            "email": worker.account_email or worker.credential_email or "",
+            "number": worker.phone_number or "",
+        }
+        await progress(
+            "cookies",
+            f"using W{worker.worker_id} "
+            f"({stages['worker']['email'] or 'email unknown'})",
+        )
+
+        # ── 2. harvest SAPISID-family cookies from the live Chrome ──
+        def _harvest():
+            drv = worker.driver
+            if "voice.google.com" not in (drv.current_url or ""):
+                drv.get("https://voice.google.com/u/0/calls")
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                raw = drv.execute_script("return document.cookie") or ""
+                cookies = dict(
+                    p.strip().split("=", 1)
+                    for p in raw.split(";")
+                    if "=" in p
+                )
+                if any(k in cookies for k in (
+                        "SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")):
+                    return cookies
+                time.sleep(2)
+            raise RuntimeError(
+                "no SAPISID-family cookies on voice.google.com — "
+                "session expired? (re-login this worker)")
+
+        cookies = await asyncio.to_thread(_harvest)
+        found = [k for k in ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")
+                 if k in cookies]
+        stages["cookies"] = {"found": found}
+        await progress("cookies", f"cookies ok: {', '.join(found)}")
+
+        # ── 3. mint per-session SIP credentials ──
+        from telephony.sip.gv_auth import VoiceAPIClient
+
+        api = VoiceAPIClient(cookies)
+        try:
+            creds = await asyncio.to_thread(api.get_sip_register_info)
+        except Exception as e:
+            stages["mint"] = {"ok": False, "error": str(e)}
+            raise
+        stages["mint"] = {
+            "ok": True,
+            "username": creds.username,
+            "password_len": len(creds.password),
+            "raw": _json.dumps(creds.raw)[:900],
+        }
+        await progress(
+            "mint",
+            f"SIP creds minted: {creds.username} (password len "
+            f"{len(creds.password)})",
+        )
+
+        # ── 4. REGISTER on the SIP WebSocket ──
+        from telephony.sip.sip_ws import GVWebPhone
+
+        def on_event(kind: str, info: dict):
+            slim = {k: str(v)[:160] for k, v in info.items() if k != "sdp"}
+            events.append({"kind": kind, **slim})
+            asyncio.ensure_future(progress("sip", f"event {kind} {slim}"))
+
+        phone = GVWebPhone(creds, on_event=on_event)
+        await asyncio.wait_for(phone.connect(), timeout=20)
+        try:
+            await asyncio.wait_for(phone.register(), timeout=30)
+        except Exception as e:
+            stages["register"] = {"ok": False, "error": str(e)}
+            raise RuntimeError(f"REGISTER failed: {e}")
+        stages["register"] = {"ok": True, "expires": phone._reg_expires}
+        await progress("register", "REGISTER 200 OK — signaling works")
+
+        # ── 5. optional test call (signaling only, template SDP) ──
+        if call_number:
+            from telephony.sip.templates import TEMPLATE_SDP
+
+            finished = asyncio.Event()
+
+            def on_call_event(kind: str, info: dict):
+                if kind in ("bye", "failed", "transport_lost"):
+                    finished.set()
+
+            phone.on_event = lambda k, i: (on_event(k, i), on_call_event(k, i))
+            await phone.start_call(call_number, TEMPLATE_SDP)
+            await progress("call", f"INVITE sent to {call_number}")
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=hold)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await phone.hangup()
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+            verdict = next(
+                (e["kind"] for e in reversed(events)
+                 if e["kind"] in ("answered", "failed", "bye")),
+                "no-answer",
+            )
+            stages["call"] = {
+                "number": call_number,
+                "verdict": verdict,
+                "flow": [e["kind"] for e in events
+                         if e["kind"] in ("calling", "ringing", "early_media",
+                                          "answered", "failed", "bye")],
+            }
+            await progress("call", f"call verdict: {verdict}")
+
+    except Exception as e:
+        error = str(e)
+        logger.exception(f"[job {job_id}] sip_test failed")
+    finally:
+        if phone is not None:
+            try:
+                await phone.close()
+            except Exception:
+                pass
+        await bus.publish_result({
+            "job_id": job_id, "agent_id": aid, "kind": "sip_done",
+            "stages": stages, "events": events[-40:], "error": error,
+        })
+        logger.info(f"[job {job_id}] sip_test done (error={error})")
+
+
 async def _handle_login_job(pool, bus, job: dict):
     """Apply operator credentials and sign the matching profiles in.
 
@@ -813,7 +980,9 @@ async def run_agent():
 
     # Auto-login also runs detached: signing N browsers in costs minutes.
     login_state = {"task": None}
-
+    # SIP backend test (signaling) also runs detached — it can hold a test
+    # call for up to ~2 minutes and the loop must stay responsive.
+    sip_state = {"task": None}
     # Pool init runs detached too, so a /login that arrives while Chrome is
     # still coming up can cancel the pending re-init instead of racing it —
     # that overlap was spawning a second Chrome on the same profile.
@@ -1056,6 +1225,24 @@ async def run_agent():
                                 st["task"] = None
 
                         p1_state["task"].add_done_callback(_clear_p1)
+                    elif jtype == "sip_test":
+                        # Runs up to ~2 min (call hold) — detach like login so
+                        # the loop stays free for p1stop & co.
+                        st = sip_state.get("task")
+                        if st and not st.done():
+                            await bus.publish_result({
+                                "job_id": jid, "agent_id": config.AGENT_ID,
+                                "kind": "sip_done", "stages": {}, "events": [],
+                                "error": "a SIP test is already running on this agent",
+                            })
+                        else:
+                            sip_state["task"] = asyncio.create_task(
+                                _handle_sip_test_job(pool, bus, job),
+                                name=f"siptest_{jid}",
+                            )
+                            sip_state["task"].add_done_callback(
+                                _log_task_exception
+                            )
                     elif jtype == "p1stop":
                         await _hard_p1_stop("p1stop")
                     elif jtype == "call":

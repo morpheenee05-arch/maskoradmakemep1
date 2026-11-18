@@ -146,6 +146,9 @@ async def _home_payload(context) -> tuple:
         ],
         [
             InlineKeyboardButton("🖥 Agents", callback_data="camp:agents"),
+            InlineKeyboardButton("🧪 SIP test", callback_data="camp:sip"),
+        ],
+        [
             InlineKeyboardButton("⚙️ Settings", callback_data="camp:set"),
         ],
         [InlineKeyboardButton("🔄 Refresh", callback_data="camp:home")],
@@ -1058,6 +1061,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from bot.commands.status import status_command
             await status_command(_shim(update, query), context)
 
+        elif route == "sip":
+            from bot.commands.siptest import handle_sip_callback
+            await handle_sip_callback(update, context, query, parts)
+
         elif route == "set":
             text, markup = await _settings_home_payload(context)
             await _edit(query, text, markup)
@@ -1146,6 +1153,12 @@ def register_menu_handlers(application):
     # can stop propagation only while a settings input is actually pending.
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, settings_text_input),
+        group=-1,
+    )
+    # SIP test call-number capture — same pending-input pattern.
+    from bot.commands.siptest import sip_text_input
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, sip_text_input),
         group=-1,
     )
     logger.info("Registered menu handlers")
