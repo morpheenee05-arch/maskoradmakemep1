@@ -29,6 +29,10 @@ from typing import Mapping, Optional
 import requests
 
 ORIGIN = "https://voice.google.com"
+# The gapi client executing the request lives inside the proxy iframe on
+# clients6.google.com, so its window.location.origin — and therefore the
+# SAPISIDHASH origin input — is the clients6 host, not voice.google.com.
+AUTH_ORIGIN = "https://clients6.google.com"
 API_KEY = "AIzaSyDTYc1N4xiODyrQYK0Kl6g_y279LjYkrBg"
 SIP_REGISTER_INFO_URL = (
     "https://clients6.google.com/voice/v1/voiceclient/sipregisterinfo/get"
@@ -87,7 +91,7 @@ class SipCredentials:
         return time.time() > self.minted_at + max(0, self.expires_in - margin)
 
 
-def sapisid_hash(cookie_value: str, origin: str = ORIGIN, ts: Optional[int] = None) -> str:
+def sapisid_hash(cookie_value: str, origin: str = AUTH_ORIGIN, ts: Optional[int] = None) -> str:
     ts = ts or int(time.time())
     digest = hashlib.sha1(f"{ts} {cookie_value} {origin}".encode()).hexdigest()
     return f"{ts}_{digest}"
@@ -111,6 +115,12 @@ class VoiceAPIClient:
                 cookies[k.strip()] = v.strip()
         return cls(cookies, **kw)
 
+    def _cookie_value(self, name: str) -> str:
+        v = self.cookies.get(name)
+        if isinstance(v, dict):
+            return v.get("value", "")
+        return v or ""
+
     def _authorization(self) -> str:
         parts = []
         for cookie_name, scheme in (
@@ -118,7 +128,7 @@ class VoiceAPIClient:
             ("__Secure-1PAPISID", "SAPISID1PHASH"),
             ("__Secure-3PAPISID", "SAPISID3PHASH"),
         ):
-            value = self.cookies.get(cookie_name)
+            value = self._cookie_value(cookie_name)
             if value:
                 parts.append(f"{scheme} {sapisid_hash(value)}")
         if not parts:
@@ -132,12 +142,15 @@ class VoiceAPIClient:
         # The web client calls this API through the gapi proxy iframe hosted
         # ON clients6.google.com, so Origin/Referer must match that host
         # (XD3 check: "Origin doesn't match Host" otherwise) while the app
-        # origin (voice.google.com) travels in X-Origin/X-Referer.
+        # origin (voice.google.com) travels in X-Origin/X-Referer. The
+        # browser also sends the .google.com cookies — SAPISIDHASH alone is
+        # not always enough for this endpoint.
         return {
             "Authorization": self._authorization(),
+            "Cookie": self._cookie_header(),
             "Content-Type": "application/json+protobuf",
             "Accept": "*/*",
-            "Origin": "https://clients6.google.com",
+            "Origin": AUTH_ORIGIN,
             "Referer": GAPI_PROXY_REFERER,
             "X-Origin": ORIGIN,
             "X-Referer": ORIGIN,
@@ -148,6 +161,27 @@ class VoiceAPIClient:
             "X-Client-Version": "1023720527",
             "User-Agent": USER_AGENT,
         }
+
+    def _cookie_header(self) -> str:
+        """Cookies the browser would send to clients6.google.com.
+
+        `self.cookies` may carry per-cookie domain info (CDP harvest) as
+        {"NAME": {"value": ..., "domain": ...}} or plain name→value pairs
+        (document.cookie harvest — assumed .google.com).
+        """
+        parts = []
+        for name, val in self.cookies.items():
+            if isinstance(val, dict):
+                domain = (val.get("domain") or "").lstrip(".")
+                value = val.get("value", "")
+                if domain and not (
+                        "clients6.google.com".endswith(domain)
+                        or domain.endswith("clients6.google.com")):
+                    continue
+            else:
+                value = val
+            parts.append(f"{name}={value}")
+        return "; ".join(parts)
 
     def _post(self, url: str, body: str) -> list:
         resp = self.session.post(

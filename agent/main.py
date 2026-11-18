@@ -212,18 +212,31 @@ async def _handle_sip_test_job(pool, bus, job: dict):
         )
 
         # ── 2. harvest SAPISID-family cookies from the live Chrome ──
+        # CDP Storage.getCookies sees HttpOnly cookies too (SID/HSID) —
+        # document.cookie does not, and the endpoint wants the full set.
         def _harvest():
             drv = worker.driver
             if "voice.google.com" not in (drv.current_url or ""):
                 drv.get("https://voice.google.com/u/0/calls")
             deadline = time.time() + 40
             while time.time() < deadline:
-                raw = drv.execute_script("return document.cookie") or ""
-                cookies = dict(
-                    p.strip().split("=", 1)
-                    for p in raw.split(";")
-                    if "=" in p
-                )
+                cookies = {}
+                try:
+                    res = drv.execute_cdp_cmd("Storage.getCookies", {})
+                    for c in res.get("cookies", []):
+                        if "google.com" in (c.get("domain") or ""):
+                            cookies[c["name"]] = {
+                                "value": c.get("value", ""),
+                                "domain": c.get("domain", ""),
+                            }
+                except Exception:
+                    cookies = {}
+                if not cookies:
+                    raw = drv.execute_script("return document.cookie") or ""
+                    cookies = {
+                        p.strip().split("=", 1)[0]: p.strip().split("=", 1)[1]
+                        for p in raw.split(";") if "=" in p
+                    }
                 if any(k in cookies for k in (
                         "SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")):
                     return cookies
