@@ -71,3 +71,6 @@ storage/prompts.json
 storage/script_templates.json
 storage/bot_settings.json
 storage/.update_applied
+
+# SIP reverse-engineering captures (contain live cookies/credentials)
+captures/
