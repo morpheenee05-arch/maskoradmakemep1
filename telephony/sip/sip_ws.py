@@ -202,8 +202,8 @@ class GVWebPhone:
                 .replace("/", "%2F").replace("=", "%3D"))
         return f"sip:{user}@{self.creds.domain}"
 
-    async def _send(self, msg: SipMessage) -> str:
-        branch = _rand_branch()
+    async def _send(self, msg: SipMessage, branch: Optional[str] = None) -> str:
+        branch = branch or _rand_branch()
         msg.headers.insert(0, (
             "Via",
             f"SIP/2.0/wss {self._via_host};branch={branch};keep",
@@ -212,6 +212,16 @@ class GVWebPhone:
         log.debug("SIP C→S\n%s", data.decode(errors="replace"))
         await self._ws.send(data)
         return branch
+
+    async def _send_tracked(self, msg: SipMessage) -> tuple:
+        """Register the pending-answer future BEFORE sending, so a fast
+        response (same event-loop tick) can never be dropped as unmatched."""
+        branch = _rand_branch()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending[branch] = fut
+        await self._send(msg, branch)
+        return branch, fut
 
     def _new_request(self, method: str, uri: str, *, call_id: str,
                      from_uri: str, from_tag: str, to_uri: str, to_tag: str = "",
@@ -232,10 +242,7 @@ class GVWebPhone:
 
     async def _request(self, msg: SipMessage, timeout: float = 20.0) -> SipMessage:
         """Send a request and wait for its final response."""
-        branch = await self._send(msg)
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._pending[branch] = fut
+        branch, fut = await self._send_tracked(msg)
         try:
             return await asyncio.wait_for(fut, timeout)
         finally:
@@ -436,12 +443,10 @@ class GVWebPhone:
         )
         self.dialog = dialog
 
-        # send manually to learn the branch, responses arrive via _handle_response
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        branch = await self._send(msg)
+        # send with the future already registered — a fast 183/200 must
+        # never arrive to an empty pending table
+        branch, _fut = await self._send_tracked(msg)
         dialog.invite_branch = branch
-        self._pending[branch] = fut
         self._emit("calling", {"number": number, "call_id": call_id})
         return dialog
 
@@ -449,6 +454,7 @@ class GVWebPhone:
         d = self.dialog
         if not d:
             return
+        self._pending.pop(d.invite_branch, None)
         if d.answered:
             await self._send_in_dialog("BYE")
         else:
@@ -498,6 +504,7 @@ class GVWebPhone:
             return
         code = msg.status_code
         if 200 <= code < 300:
+            self._pending.pop(d.invite_branch, None)
             self._update_dialog_from_response(d, msg)
             d.answered = True
             se = msg.header("Session-Expires") or ""
@@ -510,6 +517,7 @@ class GVWebPhone:
             self._emit("answered", {"sdp": msg.body,
                                     "call_leg_id": msg.header("X-GV-CallLegId") or ""})
         elif code >= 300:
+            self._pending.pop(d.invite_branch, None)
             self._emit("failed", {"code": code, "reason": msg.reason})
             self.dialog = None
 
@@ -600,6 +608,8 @@ class GVWebPhone:
                 ("P-RTP-Stat", ""),           # filled by media layer later
                 ("Reason", 'Google ;cause=0 ;text=""'),
             ])
+            if self.dialog:
+                self._pending.pop(self.dialog.invite_branch, None)
             self._emit("bye", {"reason": msg.header("Reason") or ""})
             self.dialog = None
             return

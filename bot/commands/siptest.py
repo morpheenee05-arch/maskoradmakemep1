@@ -173,7 +173,7 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
         await message.reply_text("⚠️ Redis bus is not available.")
         return
 
-    params = {"hold": 25}
+    params = {"hold": 20}
     if call:
         params["call"] = call
     try:
@@ -182,7 +182,8 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
         await message.reply_text(f"❌ Dispatch failed: {_esc(e)}", parse_mode="HTML")
         return
 
-    timeout = int(os.getenv("SIP_TEST_TIMEOUT_SEC", "180" if call else "120"))
+    timeout = int(os.getenv("SIP_TEST_TIMEOUT_SEC", "90" if call else "60"))
+    started = time.time()
     status = await message.reply_text(
         _render_live(aid, {}, [f"job dispatched → {aid}"]),
         parse_mode="HTML",
@@ -192,8 +193,8 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
     stages: dict = {}
     log_lines: list = []
     done = None
-    deadline = time.time() + timeout
-    last_edit = 0.0
+    deadline = started + timeout
+    last_edit = time.time()
     try:
         while time.time() < deadline:
             msgs = await bus.consume_results(group, block_ms=2000)
@@ -204,8 +205,7 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
                         continue
                     kind = msg.get("kind")
                     if kind == "sip_progress":
-                        line = msg.get("line", "")
-                        log_lines.append(line)
+                        log_lines.append(msg.get("line", ""))
                     elif kind == "sip_done":
                         done = msg
                 except Exception as e:
@@ -213,11 +213,16 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
             if done is not None:
                 break
             now = time.time()
-            if msgs and now - last_edit > 1.0:
+            # Heartbeat edit: on fresh logs, or every ~6s of silence so the
+            # chat never looks frozen.
+            if (msgs and now - last_edit > 1.0) or (now - last_edit > 6.0):
                 last_edit = now
+                elapsed = int(now - started)
+                view = list(log_lines) or ["waiting for the agent…"]
                 try:
                     await status.edit_text(
-                        _render_live(aid, stages, log_lines),
+                        _render_live(aid, stages,
+                                     view + [f"… {elapsed}s / {timeout}s"]),
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -313,13 +318,20 @@ async def sip_text_input(update, context):
 
     import re as _re
     number = _re.sub(r"[^\d+]", "", text)
-    if not number.startswith("+") or len(number) < 8:
+    if not number.startswith("+"):
+        number = "+" + number if number else ""
+    if len(number) < 8:
         await update.message.reply_text(
-            "⚠️ That does not look like an E.164 number "
-            "(<code>+14036139786</code>) — cancelled.",
+            "⚠️ That does not look like a phone number "
+            "(e.g. <code>+14036139786</code>) — cancelled.",
             parse_mode="HTML",
         )
         raise ApplicationHandlerStop
 
+    await update.message.reply_text(
+        f"📞 Calling <code>{_esc(number)}</code> via "
+        f"<b>{_esc(pending['agent'])}</b> — live log below 👇",
+        parse_mode="HTML",
+    )
     await run_sip_test(update.message, context, pending["agent"], call=number)
     raise ApplicationHandlerStop
