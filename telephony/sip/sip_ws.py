@@ -495,7 +495,10 @@ class GVWebPhone:
         if msg.status_code in (180, 183):
             self._update_dialog_from_response(d, msg)
             if (msg.header("Require") or "").lower() == "100rel":
-                await self._send_prack(d, msg)
+                # PRACK waits for its 200 OK — must run as a task, otherwise
+                # the reader loop blocks here and can never read that very
+                # response (self-deadlock until the timeout).
+                asyncio.create_task(self._send_prack(d, msg))
             try:
                 rseq = int(msg.header("RSeq") or 0)
             except ValueError:
