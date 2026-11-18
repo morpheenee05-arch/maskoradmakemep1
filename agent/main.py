@@ -252,24 +252,79 @@ async def _handle_sip_test_job(pool, bus, job: dict):
         await progress("cookies", f"cookies ok: {', '.join(found)}")
 
         # ── 3. mint per-session SIP credentials ──
-        from telephony.sip.gv_auth import VoiceAPIClient
+        # Primary path: let the browser make the call itself — we hook XHR
+        # via CDP addScriptToEvaluateOnNewDocument (fires in the gapi proxy
+        # iframe too), reload the page and capture request headers + response
+        # body of the real sipregisterinfo exchange. This also tells us the
+        # exact SAPISIDHASH origin so the pure-Python path can be fixed.
+        from telephony.sip.gv_auth import (
+            VoiceAPIClient, parse_sip_credentials,
+        )
+        from telephony.sip.sniff import SIP_HOOK_JS, diagnose_auth_origin
 
-        api = VoiceAPIClient(cookies)
-        try:
-            creds = await asyncio.to_thread(api.get_sip_register_info)
-        except Exception as e:
-            stages["mint"] = {"ok": False, "error": str(e)}
-            raise
-        stages["mint"] = {
-            "ok": True,
-            "username": creds.username,
-            "password_len": len(creds.password),
-            "raw": _json.dumps(creds.raw)[:900],
-        }
+        def _sniff():
+            drv = worker.driver
+            drv.execute_cdp_cmd("Page.enable", {})
+            drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument",
+                                {"source": SIP_HOOK_JS})
+            drv.get("https://voice.google.com/u/0/calls")
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                try:
+                    cap = drv.execute_script(
+                        "return window.__sipCredCapture || null")
+                except Exception:
+                    cap = None
+                if cap and cap.get("body"):
+                    return cap
+                time.sleep(2)
+            return None
+
+        creds = None
+        captured = await asyncio.to_thread(_sniff)
+        if captured:
+            await progress("mint", "sniffed live sipregisterinfo exchange")
+            match = diagnose_auth_origin(
+                captured.get("reqHeaders", {}).get("authorization") or
+                captured.get("reqHeaders", {}).get("Authorization") or "",
+                cookies,
+            )
+            if match:
+                await progress("mint", f"SAPISIDHASH origin proven: {match}")
+                stages["auth_origin"] = match
+            try:
+                creds = parse_sip_credentials(_json.loads(captured["body"]))
+                stages["mint"] = {
+                    "ok": True, "source": "in-page sniff",
+                    "username": creds.username,
+                    "password_len": len(creds.password),
+                    "raw": captured["body"][:900],
+                    "req_body": captured.get("reqBody", "")[:200],
+                }
+            except Exception as e:
+                stages["mint"] = {"ok": False, "source": "in-page sniff",
+                                  "error": str(e),
+                                  "raw": captured.get("body", "")[:900]}
+                raise RuntimeError(f"sniffed response parse failed: {e}")
+        else:
+            await progress(
+                "mint", "in-page sniff timed out — falling back to direct API")
+            api = VoiceAPIClient(cookies)
+            try:
+                creds = await asyncio.to_thread(api.get_sip_register_info)
+            except Exception as e:
+                stages["mint"] = {"ok": False, "source": "direct API",
+                                  "error": str(e)}
+                raise
+            stages["mint"] = {
+                "ok": True, "source": "direct API",
+                "username": creds.username,
+                "password_len": len(creds.password),
+                "raw": _json.dumps(creds.raw)[:900],
+            }
         await progress(
             "mint",
-            f"SIP creds minted: {creds.username} (password len "
-            f"{len(creds.password)})",
+            f"SIP creds: {creds.username} (password len {len(creds.password)})",
         )
 
         # ── 4. REGISTER on the SIP WebSocket ──
