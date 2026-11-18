@@ -1146,19 +1146,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def _pending_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single group -1 text handler for all pending-input flows.
+
+    PTB runs only the FIRST matching handler per group — registering
+    settings_text_input and sip_text_input side by side meant the settings
+    one swallowed every message (even with nothing pending) and the SIP
+    number prompt never fired. One wrapper dispatches by pending flag.
+    """
+    if context.bot_data.get("sip_pending"):
+        from bot.commands.siptest import sip_text_input
+        await sip_text_input(update, context)
+        return
+    await settings_text_input(update, context)
+
+
 def register_menu_handlers(application):
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^camp:"))
-    # Settings value capture — group -1 so it runs before conversations and
-    # can stop propagation only while a settings input is actually pending.
+    # Pending-input capture (settings values, SIP test number) — group -1 so
+    # it runs before conversations and stops propagation only when a pending
+    # input is actually consumed.
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, settings_text_input),
-        group=-1,
-    )
-    # SIP test call-number capture — same pending-input pattern.
-    from bot.commands.siptest import sip_text_input
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, sip_text_input),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _pending_text_input),
         group=-1,
     )
     logger.info("Registered menu handlers")
