@@ -493,8 +493,14 @@ class GVWebPhone:
             self._update_dialog_from_response(d, msg)
             if (msg.header("Require") or "").lower() == "100rel":
                 await self._send_prack(d, msg)
+            try:
+                rseq = int(msg.header("RSeq") or 0)
+            except ValueError:
+                rseq = 0
             if msg.status_code == 183 and msg.body:
-                self._emit("early_media", {"sdp": msg.body})
+                if rseq > d.rseq_seen:
+                    d.rseq_seen = rseq
+                    self._emit("early_media", {"sdp": msg.body, "rseq": rseq})
             elif msg.status_code == 180:
                 self._emit("ringing", {})
 
@@ -531,16 +537,20 @@ class GVWebPhone:
             d.remote_target = contact.strip("<>")
         routes = msg.headers_all("Record-Route")
         if routes:
-            d.route_set = [r.strip("<>") for r in reversed(routes)]
+            d.route_set = [r.strip() for r in reversed(routes)]
 
     async def _send_prack(self, d: Dialog, prov: SipMessage):
         rseq = prov.header("RSeq") or "0"
         cseq_hdr = prov.header("CSeq") or ""
         invite_cseq = cseq_hdr.split()[0] if cseq_hdr else str(d.cseq)
-        d.cseq += 1
         msg = self._dialog_request("PRACK")
         msg.headers.append(("RAck", f"{rseq} {invite_cseq} INVITE"))
-        await self._send(msg)
+        try:
+            resp = await self._request(msg, timeout=15)
+            log.info("PRACK rseq=%s -> %s", rseq, resp.status_code)
+        except Exception as e:
+            log.warning("PRACK rseq=%s failed: %s", rseq, e)
+            self._emit("prack_failed", {"rseq": rseq, "error": str(e)})
 
     async def _send_ack(self, d: Dialog):
         msg = self._dialog_request("ACK", increment=False)
@@ -559,8 +569,7 @@ class GVWebPhone:
             to_uri=d.remote_uri, to_tag=d.remote_tag,
             cseq=d.cseq,
         )
-        for route in d.route_set:
-            msg.headers.insert(0, ("Route", route))
+        msg.headers = [("Route", r) for r in d.route_set] + msg.headers
         msg.headers.append(("Supported", "outbound,record-aware"))
         return msg
 
