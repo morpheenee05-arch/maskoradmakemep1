@@ -29,10 +29,11 @@ from typing import Mapping, Optional
 import requests
 
 ORIGIN = "https://voice.google.com"
-# The gapi client executing the request lives inside the proxy iframe on
-# clients6.google.com, so its window.location.origin — and therefore the
-# SAPISIDHASH origin input — is the clients6 host, not voice.google.com.
-AUTH_ORIGIN = "https://clients6.google.com"
+# SAPISIDHASH origin PROVEN by sniffing the live exchange (diagnose_auth_origin
+# matched the browser's own hash): the hash input is the app origin
+# voice.google.com, even though the XHR physically runs in the clients6
+# proxy iframe (gapi computes auth in the parent page context).
+AUTH_ORIGIN = "https://voice.google.com"
 API_KEY = "AIzaSyDTYc1N4xiODyrQYK0Kl6g_y279LjYkrBg"
 SIP_REGISTER_INFO_URL = (
     "https://clients6.google.com/voice/v1/voiceclient/sipregisterinfo/get"
@@ -227,10 +228,20 @@ def _looks_like_sip_username(s: str) -> bool:
 def parse_sip_credentials(data) -> SipCredentials:
     """Extract username/password from the protojson response.
 
-    The exact field layout is unverified (response body was not in the
-    capture), so this walks every string in the structure and applies
-    heuristics; keep `raw` for debugging the first live response.
+    Layout proven by the in-page sniff:
+        [["1795207594", 287709000], null, null, ["<username>", "<password>"]]
+    Field 4 (index 3) is [username, password]. Heuristic walk kept as a
+    fallback in case Google rotates the shape.
     """
+    try:
+        pair = data[3]
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2 \
+                and isinstance(pair[0], str) and isinstance(pair[1], str) \
+                and _looks_like_sip_username(pair[0]):
+            return SipCredentials(username=pair[0], password=pair[1], raw=data)
+    except (TypeError, IndexError):
+        pass
+
     strings: list[str] = []
     _flatten_strings(data, strings)
 

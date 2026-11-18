@@ -185,9 +185,11 @@ class GVWebPhone:
 
     # ── plumbing ──
 
-    def _emit(self, kind: str, **info):
+    def _emit(self, kind: str, info: Optional[dict] = None, **kw):
+        payload = dict(info or {})
+        payload.update(kw)
         try:
-            self.on_event(kind, info)
+            self.on_event(kind, payload)
         except Exception:
             log.exception("on_event callback failed")
 
