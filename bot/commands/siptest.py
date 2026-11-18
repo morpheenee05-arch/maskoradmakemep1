@@ -156,12 +156,45 @@ def _render_live(aid: str, stages: dict, log_lines: list,
         lines += ["", f"❌ <b>Error:</b> {_esc(error)}"]
     if done is not None and done.get("error"):
         lines += ["", f"❌ <b>Agent error:</b> {_esc(done['error'])}"]
-    if log_lines:
-        tail = "\n".join(_esc(l) for l in log_lines[-10:])
-        lines += ["", f"<code>{tail}</code>"]
     if done is None:
-        lines += ["", "<i>Running…</i>"]
+        last = _esc(log_lines[-1]) if log_lines else "waiting for the agent…"
+        lines += ["", f"<i>Running… {last}</i>"]
+    else:
+        lines += ["", f"📄 Full log: {len(log_lines)} lines — attached as .log"]
     return "\n".join(lines)
+
+
+def _build_log_file(aid: str, jid: str, call: str, stages: dict,
+                    log_lines: list, done, error: str) -> str:
+    """Assemble the complete run log shipped to chat as a .log document."""
+    import datetime
+    head = [
+        f"SIP backend test log",
+        f"agent:   {aid}",
+        f"job:     {jid}",
+        f"time:    {datetime.datetime.now().isoformat(timespec='seconds')}",
+        f"call:    {call or '(no call — register only)'}",
+        "",
+        "── stages ──",
+    ]
+    for name in _STAGE_ORDER:
+        if name in stages:
+            # plain-text stage line (strip HTML tags used in chat rendering)
+            import re as _re
+            head.append(_re.sub(r"<[^>]+>", "", _stage_line(name, stages[name])))
+    body = ["", "── live progress ──"] + (log_lines or ["(none)"])
+    events = ["", "── events ──"]
+    if done:
+        for e in done.get("events") or []:
+            slim = {k: v for k, v in e.items() if k != "kind"}
+            events.append(f"event {e.get('kind')} {slim if slim else ''}")
+        if done.get("error"):
+            events.append(f"AGENT ERROR: {done['error']}")
+    else:
+        events.append(f"NO RESULT: {error or 'timeout'}")
+    raw = (stages.get("mint") or {}).get("raw")
+    tail = ["", "── raw sipregisterinfo ──", raw] if raw else []
+    return "\n".join(str(x) for x in head + body + events + tail)
 
 
 # ── run & collect ────────────────────────────────────────────────────────────
@@ -218,11 +251,10 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
             if (msgs and now - last_edit > 1.0) or (now - last_edit > 6.0):
                 last_edit = now
                 elapsed = int(now - started)
-                view = list(log_lines) or ["waiting for the agent…"]
                 try:
                     await status.edit_text(
                         _render_live(aid, stages,
-                                     view + [f"… {elapsed}s / {timeout}s"]),
+                                     log_lines + [f"… {elapsed}s / {timeout}s"]),
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -241,6 +273,8 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
             )
         except Exception:
             pass
+        await _send_log(status, aid, jid, call, stages, log_lines, None,
+                        f"timeout after {timeout}s")
         return
 
     stages = done.get("stages") or {}
@@ -260,17 +294,24 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
     except Exception:
         pass
 
-    # The raw sipregisterinfo response is gold while the parser is young —
-    # ship it as a separate collapsible message.
-    raw = (stages.get("mint") or {}).get("raw")
-    if raw:
-        try:
-            await status.reply_text(
-                f"🔬 raw sipregisterinfo:\n<code>{_esc(raw[:3500])}</code>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+    await _send_log(status, aid, jid, call, stages, log_lines, done, "")
+
+
+async def _send_log(status, aid: str, jid: str, call: str, stages: dict,
+                    log_lines: list, done, error: str):
+    """Ship the full run log as a .log document — chat stays compact."""
+    import io
+    text = _build_log_file(aid, jid, call, stages, log_lines, done, error)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"sip_test_{aid}_{ts}.log"
+    try:
+        await status.reply_document(
+            document=io.BytesIO(text.encode("utf-8")),
+            filename=filename,
+            caption=f"📄 Full SIP test log — {aid}",
+        )
+    except Exception as e:
+        logger.warning(f"sip log document failed: {e}")
 
 
 # ── callback routing (from menu.py, camp:sip…) ───────────────────────────────
