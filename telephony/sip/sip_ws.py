@@ -343,7 +343,8 @@ class GVWebPhone:
         if m:
             self._reg_expires = int(m.group(1))
         self._reregister_task = asyncio.create_task(self._reregister_loop())
-        self._emit("registered", {"expires": self._reg_expires})
+        self._emit("registered", {"expires": self._reg_expires,
+                                  "p_associated": bool(self._p_associated)})
 
     def _register_message(self, cseq: int) -> SipMessage:
         msg = self._new_request(
@@ -447,7 +448,9 @@ class GVWebPhone:
         # never arrive to an empty pending table
         branch, _fut = await self._send_tracked(msg)
         dialog.invite_branch = branch
-        self._emit("calling", {"number": number, "call_id": call_id})
+        self._emit("calling", {"number": number, "call_id": call_id,
+                               "ppi": bool(self._p_associated),
+                               "pcc": bool(self.place_call_context)})
         return dialog
 
     async def hangup(self):
