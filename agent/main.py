@@ -349,6 +349,49 @@ async def _handle_sip_test_job(pool, bus, job: dict):
         if call_number:
             from telephony.sip.templates import TEMPLATE_SDP
 
+            # ── 5a. mint X-GV-PlaceCallContext via the live page ──
+            # The page's own JS (encryptPlaceCallContext) builds this blob;
+            # without it the callee sees "Unknown". We arm a WS send hook,
+            # let the page build its INVITE for this number, capture the
+            # header and swallow the page's frame (a synthetic 603 settles
+            # the page stack, no real call is placed by the browser).
+            from telephony.sip.sniff import PCC_DIAL_JS, PCC_HOOK_JS
+
+            def _mint_pcc():
+                drv = worker.driver
+                drv.execute_script(PCC_HOOK_JS)
+                drv.execute_script(
+                    "window.__pccArm = true; window.__pccCapture = null;")
+                try:
+                    res = drv.execute_async_script(PCC_DIAL_JS, call_number)
+                finally:
+                    drv.execute_script("window.__pccArm = false;")
+                return res
+
+            pcc = None
+            try:
+                res = await asyncio.to_thread(_mint_pcc)
+                if res and res.get("ok"):
+                    cap = await asyncio.to_thread(
+                        lambda: worker.driver.execute_script(
+                            "return window.__pccCapture || null"))
+                    if cap and cap.get("header"):
+                        pcc = cap["header"]
+                if pcc:
+                    stages["pcc"] = {"ok": True, "len": len(pcc)}
+                    await progress(
+                        "call", f"PlaceCallContext minted ({len(pcc)} chars)")
+                else:
+                    detail = "; ".join((res or {}).get("log") or [])[:300]
+                    stages["pcc"] = {"ok": False, "log": detail}
+                    await progress(
+                        "call", f"PlaceCallContext mint failed: {detail}")
+            except Exception as e:
+                stages["pcc"] = {"ok": False, "error": str(e)[:300]}
+                await progress("call", f"PlaceCallContext mint error: {e}")
+            if pcc:
+                phone.place_call_context = pcc
+
             finished = asyncio.Event()
 
             def on_call_event(kind: str, info: dict):

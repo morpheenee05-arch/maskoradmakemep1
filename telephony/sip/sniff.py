@@ -105,3 +105,161 @@ def diagnose_auth_origin(authorization: str, cookies: Mapping) -> Optional[str]:
         if digest == captured:
             return origin
     return None
+
+
+# ── X-GV-PlaceCallContext oracle ──────────────────────────────────────────────
+#
+# The web client stamps every INVITE with X-GV-PlaceCallContext — a ~5.5KB
+# encrypted jspb blob produced in-page by `encryptPlaceCallContext` (seen in
+# the V8 code cache). Without it Google sends the call out without caller ID
+# (callee sees "Unknown"). The blob is per-call and cannot be forged outside
+# the page, so we use the page itself as the generator:
+#
+#   PCC_HOOK_JS  wraps WebSocket.prototype.send; while armed it intercepts the
+#                page's own INVITE, stores the header in window.__pccCapture,
+#                SWALLOWS the frame (the page's call never hits the network)
+#                and feeds the page stack a synthetic 603 Decline so it
+#                settles immediately.
+#   PCC_DIAL_JS  drives the dialer UI: finds the number input, types the
+#                number, presses Enter / clicks the call button.
+
+PCC_HOOK_JS = r"""
+(function () {
+  if (window.__pccHooked) return 'already';
+  window.__pccHooked = true;
+  window.__pccArm = false;
+  window.__pccCapture = null;
+
+  function fake603(invite) {
+    function h(name) {
+      var m = invite.match(new RegExp('^' + name + ':[ \\t]*(.*)$', 'mi'));
+      return m ? m[1].replace(/\r/g, '').trim() : '';
+    }
+    var via = h('Via'), fr = h('From'), to = h('To'), ci = h('Call-ID'), cs = h('CSeq');
+    if (to.indexOf('tag=') === -1) to += ';tag=gvdecline';
+    return 'SIP/2.0 603 Decline\r\n' +
+      'Via: ' + via + '\r\n' +
+      'From: ' + fr + '\r\n' +
+      'To: ' + to + '\r\n' +
+      'Call-ID: ' + ci + '\r\n' +
+      'CSeq: ' + cs + '\r\n' +
+      'Content-Length: 0\r\n\r\n';
+  }
+
+  var _send = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    try {
+      if (window.__pccArm && typeof data === 'string' && data.indexOf('INVITE sip:') === 0) {
+        var m = data.match(/^X-GV-PlaceCallContext:[ \t]*jspb=(\S+)/mi);
+        if (m) {
+          window.__pccCapture = { header: m[1], ts: Date.now() };
+        }
+        var sock = this;
+        var resp = fake603(data);
+        setTimeout(function () {
+          try { sock.dispatchEvent(new MessageEvent('message', { data: resp })); } catch (e) {}
+        }, 30);
+        return;  // swallowed — the page's call never reaches the network
+      }
+    } catch (e) {}
+    return _send.apply(this, arguments);
+  };
+  return 'installed';
+})();
+"""
+
+PCC_DIAL_JS = r"""
+var number = arguments[0];
+var done = arguments[arguments.length - 1];
+var log = [];
+
+function vis(el) {
+  try { var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+  catch (e) { return false; }
+}
+function describe(el) {
+  return el.tagName + '|' + (el.getAttribute('aria-label') || '') + '|' +
+         (el.placeholder || '') + '|' + (el.textContent || '').trim().slice(0, 40);
+}
+function findInput() {
+  var cands = document.querySelectorAll('input');
+  for (var i = 0; i < cands.length; i++) {
+    var el = cands[i];
+    var s = ((el.getAttribute('aria-label') || '') + ' ' + (el.placeholder || '') +
+             ' ' + (el.id || '') + ' ' + (el.name || '')).toLowerCase();
+    if (/number|номер|phone|dial|телефон/.test(s) && vis(el)) return el;
+  }
+  return null;
+}
+function findCallStart() {
+  var btns = document.querySelectorAll('button,[role="button"]');
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    var s = ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).toLowerCase();
+    if (/make a call|позвонить|new call|вызов/.test(s) && vis(b)) return b;
+  }
+  return null;
+}
+function findCallGo() {
+  var btns = document.querySelectorAll('button,[role="button"]');
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    var a = (b.getAttribute('aria-label') || '').toLowerCase();
+    if ((/^call\b/.test(a) || /^позвонить/.test(a)) && vis(b)) return b;
+  }
+  return null;
+}
+function typeNumber(input) {
+  input.focus();
+  var setter = Object.getOwnPropertyDescriptor(
+    window.HTMLInputElement.prototype, 'value').set;
+  setter.call(input, number);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  log.push('typed ' + number + ' into ' + describe(input));
+}
+function pressEnter(input) {
+  ['keydown', 'keypress', 'keyup'].forEach(function (t) {
+    input.dispatchEvent(new KeyboardEvent(t, {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+    }));
+  });
+  log.push('pressed Enter');
+}
+
+var t0 = Date.now();
+var dialed = false;
+var clickedGo = false;
+(function poll() {
+  if (window.__pccCapture) {
+    log.push('captured after ' + (Date.now() - t0) + 'ms');
+    return done({ ok: true, log: log });
+  }
+  if (Date.now() - t0 > 25000) {
+    var seen = Array.prototype.map.call(
+      document.querySelectorAll('button,[role="button"],input'), describe);
+    return done({ ok: false, log: log, seen: seen.slice(0, 60) });
+  }
+  var input = findInput();
+  if (!input) {
+    var start = findCallStart();
+    if (start && !start.__pccClicked) {
+      start.__pccClicked = true;
+      start.click();
+      log.push('clicked call-start: ' + describe(start));
+    }
+  } else if (!dialed) {
+    dialed = true;
+    typeNumber(input);
+    pressEnter(input);
+  } else if (dialed && !clickedGo && Date.now() - t0 > 6000) {
+    var go = findCallGo();
+    if (go) {
+      clickedGo = true;
+      go.click();
+      log.push('clicked call-go: ' + describe(go));
+    }
+  }
+  setTimeout(poll, 500);
+})();
+"""

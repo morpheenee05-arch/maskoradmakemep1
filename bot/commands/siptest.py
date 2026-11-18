@@ -107,12 +107,13 @@ def sip_number_prompt_payload(aid: str) -> tuple:
 
 # ── rendering ────────────────────────────────────────────────────────────────
 
-_STAGE_ORDER = ("worker", "cookies", "mint", "register", "call")
+_STAGE_ORDER = ("worker", "cookies", "mint", "register", "pcc", "call")
 _STAGE_TITLE = {
     "worker": "Worker",
     "cookies": "Cookies",
     "mint": "SIP credentials",
     "register": "REGISTER",
+    "pcc": "Caller-ID context",
     "call": "Test call",
 }
 
@@ -137,6 +138,11 @@ def _stage_line(name: str, data) -> str:
         if not data.get("ok"):
             return f"❌ REGISTER: {_esc(data.get('error', 'failed'))}"
         return f"✅ REGISTER 200 OK (expires {data.get('expires', '?')}s)"
+    if name == "pcc":
+        if not data.get("ok"):
+            detail = data.get("error") or data.get("log") or "failed"
+            return f"⚠️ Caller-ID context: {_esc(detail[:120])}"
+        return f"✅ Caller-ID context: {data.get('len', '?')} chars"
     if name == "call":
         verdict = data.get("verdict", "?")
         icon = {"answered": "✅", "failed": "❌", "bye": "📴"}.get(verdict, "⚠️")
@@ -150,7 +156,8 @@ def _render_live(aid: str, stages: dict, log_lines: list,
                  done: dict = None, error: str = "") -> str:
     lines = [f"🧪 <b>SIP test — {_esc(aid)}</b>", ""]
     for name in _STAGE_ORDER:
-        if name in stages or name in ("worker", "cookies", "mint", "register"):
+        if name in stages or name in ("worker", "cookies", "mint",
+                                      "register", "pcc"):
             lines.append(_stage_line(name, stages.get(name)))
     if error:
         lines += ["", f"❌ <b>Error:</b> {_esc(error)}"]
