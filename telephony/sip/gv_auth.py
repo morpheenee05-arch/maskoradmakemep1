@@ -1,0 +1,199 @@
+"""
+Google Voice SIP credential minting.
+
+The web client (voice.google.com) mints per-session SIP credentials with a
+cookie-authenticated POST to the voiceclient API:
+
+    POST https://clients6.google.com/voice/v1/voiceclient/sipregisterinfo/get
+         ?alt=protojson&key=AIzaSyDTYc1N4xiODyrQYK0Kl6g_y279LjYkrBg
+    Authorization: SAPISIDHASH <ts>_<sha1> [SAPISID1PHASH ...] [SAPISID3PHASH ...]
+    Content-Type: application/json+protobuf
+    body: small protojson array (18 bytes in the wild)
+
+SAPISIDHASH is the classic Google web auth scheme:
+    sha1(f"{unix_ts} {SAPISID_cookie} {origin}")  — origin = https://voice.google.com
+The 1P/3P variants are computed the same way from __Secure-1PAPISID /
+__Secure-3PAPISID. SAPISID is readable from JS (not HttpOnly), so agents can
+harvest it from their existing logged-in Chrome via `document.cookie`
+(CDP Runtime.evaluate) — no profile decryption needed.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Mapping, Optional
+
+import requests
+
+ORIGIN = "https://voice.google.com"
+API_KEY = "AIzaSyDTYc1N4xiODyrQYK0Kl6g_y279LjYkrBg"
+SIP_REGISTER_INFO_URL = (
+    "https://clients6.google.com/voice/v1/voiceclient/sipregisterinfo/get"
+    f"?alt=protojson&key={API_KEY}"
+)
+ACCOUNT_GET_URL = (
+    "https://clients6.google.com/voice/v1/voiceclient/account/get"
+    f"?alt=protojson&key={API_KEY}"
+)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+)
+
+# Exact 18-byte body observed in the capture was not recoverable (QUIC payload
+# is not logged by netlog). This is the most plausible protojson encoding of a
+# request with one trailing flag field set; verified/patched on first live test.
+SIP_REGISTER_INFO_BODY = "[null,null,null,1]"
+
+
+class GVAuthError(Exception):
+    pass
+
+
+@dataclass
+class SipCredentials:
+    username: str
+    password: str
+    domain: str = "web.c.pbx.voice.sip.google.com"
+    realm: str = "web.c.pbx.voice.sip.google.com"
+    # display number / account identity if the API gives us one
+    phone_number: str = ""
+    expires_in: int = 3600
+    raw: list = field(default_factory=list)
+    minted_at: float = field(default_factory=time.time)
+
+    @property
+    def uri(self) -> str:
+        return f"sip:{self.username}@{self.domain}"
+
+    def stale(self, margin: int = 300) -> bool:
+        return time.time() > self.minted_at + max(0, self.expires_in - margin)
+
+
+def sapisid_hash(cookie_value: str, origin: str = ORIGIN, ts: Optional[int] = None) -> str:
+    ts = ts or int(time.time())
+    digest = hashlib.sha1(f"{ts} {cookie_value} {origin}".encode()).hexdigest()
+    return f"{ts}_{digest}"
+
+
+class VoiceAPIClient:
+    """Cookie-authenticated client for the voiceclient protojson API."""
+
+    def __init__(self, cookies: Mapping[str, str], authuser: int = 0,
+                 session: Optional[requests.Session] = None):
+        self.cookies = dict(cookies)
+        self.authuser = authuser
+        self.session = session or requests.Session()
+
+    @classmethod
+    def from_cookie_header(cls, header: str, **kw) -> "VoiceAPIClient":
+        cookies = {}
+        for part in header.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                cookies[k.strip()] = v.strip()
+        return cls(cookies, **kw)
+
+    def _authorization(self) -> str:
+        parts = []
+        for cookie_name, scheme in (
+            ("SAPISID", "SAPISIDHASH"),
+            ("__Secure-1PAPISID", "SAPISID1PHASH"),
+            ("__Secure-3PAPISID", "SAPISID3PHASH"),
+        ):
+            value = self.cookies.get(cookie_name)
+            if value:
+                parts.append(f"{scheme} {sapisid_hash(value)}")
+        if not parts:
+            raise GVAuthError(
+                "no SAPISID/__Secure-*PAPISID cookie present — cannot build "
+                "Authorization header"
+            )
+        return " ".join(parts)
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": self._authorization(),
+            "Content-Type": "application/json+protobuf",
+            "Accept": "*/*",
+            "Origin": ORIGIN,
+            "Referer": ORIGIN + "/",
+            "X-Origin": ORIGIN,
+            "X-Referer": ORIGIN,
+            "X-Goog-AuthUser": str(self.authuser),
+            "X-Requested-With": "XMLHttpRequest",
+            "X-JavaScript-User-Agent": "google-api-javascript-client/1.1.0",
+            "X-Goog-Encode-Response-If-Executable": "base64",
+            "User-Agent": USER_AGENT,
+        }
+
+    def _post(self, url: str, body: str) -> list:
+        resp = self.session.post(
+            url, data=body.encode(), headers=self._headers(), timeout=20,
+        )
+        if resp.status_code != 200:
+            raise GVAuthError(f"{url} → HTTP {resp.status_code}: {resp.text[:300]}")
+        try:
+            return resp.json()
+        except json.JSONDecodeError as e:
+            raise GVAuthError(f"{url} → non-JSON response: {resp.text[:300]}") from e
+
+    def get_sip_register_info(self, body: str = SIP_REGISTER_INFO_BODY) -> SipCredentials:
+        data = self._post(SIP_REGISTER_INFO_URL, body)
+        return parse_sip_credentials(data)
+
+    def get_account(self, body: str = "[]") -> list:
+        return self._post(ACCOUNT_GET_URL, body)
+
+
+# ── response parsing ─────────────────────────────────────────────────────────
+
+def _flatten_strings(node, out):
+    if isinstance(node, str):
+        out.append(node)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            _flatten_strings(item, out)
+    elif isinstance(node, dict):
+        for item in node.values():
+            _flatten_strings(item, out)
+
+
+def _looks_like_sip_username(s: str) -> bool:
+    # capture: "AYpoY9vfVeuZt21oaZU6TdOvDyf2qU8YDPQbKxMQFmEjBsXKz3eOtYI="
+    # long base64-ish token, url-safe-ish, ends with '=' or not
+    if not (30 <= len(s) <= 80):
+        return False
+    alphabet = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
+    return all(c in alphabet for c in s)
+
+
+def parse_sip_credentials(data) -> SipCredentials:
+    """Extract username/password from the protojson response.
+
+    The exact field layout is unverified (response body was not in the
+    capture), so this walks every string in the structure and applies
+    heuristics; keep `raw` for debugging the first live response.
+    """
+    strings: list[str] = []
+    _flatten_strings(data, strings)
+
+    username = next((s for s in strings if _looks_like_sip_username(s)), None)
+    password = None
+    if username:
+        idx = strings.index(username)
+        # password is expected near the username in the same message
+        for s in strings[idx + 1:] + strings[:idx]:
+            if s != username and not s.startswith("sip:") and len(s) >= 6 \
+                    and "@" not in s and not s.startswith("http"):
+                password = s
+                break
+    if not username or not password:
+        raise GVAuthError(
+            "could not parse SIP credentials from sipregisterinfo response; "
+            f"strings found: {strings!r}"
+        )
+    return SipCredentials(username=username, password=password, raw=data)
