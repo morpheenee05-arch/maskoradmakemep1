@@ -41,14 +41,21 @@ except ImportError:  # pragma: no cover - depends on agent env
 
 
 def _patch_dtls12_only():
-    """Pin the DTLS handshake to version 1.2.
+    """Fix aiortc's DTLS context to interoperate with Google's media servers.
 
-    OpenSSL 3.2+ enables DTLS 1.3 and offers it in the ClientHello by
-    default; Google's media servers predate it, so we stay on the version
-    Chrome's WebRTC uses. (Kept even though it did NOT resolve the
-    'x DTLS handshake failed (error [])' failure — the wire dump below is
-    the diagnostic for that.) pyOpenSSL exposes no DTLS version constants —
-    0xFEFD is DTLS 1.2.
+    Two patches on top of aiortc's RTCCertificate._create_ssl_context:
+
+    1. Pin DTLS to 1.2 — OpenSSL 3.2+ offers DTLS 1.3 by default; Google's
+       media servers predate it (pyOpenSSL has no DTLS version constants,
+       0xFEFD is DTLS 1.2).
+    2. Add ECDHE-RSA cipher suites — aiortc offers ECDHE-ECDSA only (its own
+       cert is ECDSA), but the cipher list also constrains the SERVER's cert
+       type. Google's media servers answer an all-ECDSA ClientHello with
+       fatal handshake_failure (confirmed by wire dump: alert desc=40 right
+       after our ClientHello), i.e. they present an RSA certificate. Chrome
+       offers both families, which is why the browser works. Server
+       authenticity is still enforced via the SDP fingerprint check, so
+       accepting an RSA cert weakens nothing.
     """
     if not _HAS_AIORTC:
         return
@@ -59,21 +66,29 @@ def _patch_dtls12_only():
             return
         orig = RTCCertificate._create_ssl_context
         DTLS1_2 = 0xFEFD
+        # aiortc's list + RSA-auth counterparts (mirrors Chrome's WebRTC offer)
+        CIPHER_LIST = (
+            b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            b"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+            b"ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:"
+            b"ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA"
+        )
 
         def patched(self, srtp_profiles):
             ctx = orig(self, srtp_profiles)
             ctx.set_min_proto_version(DTLS1_2)
             ctx.set_max_proto_version(DTLS1_2)
+            ctx.set_cipher_list(CIPHER_LIST)
             return ctx
 
         patched._dtls12_pinned = True
         RTCCertificate._create_ssl_context = patched
         logger.info(
-            "sip media: DTLS pinned to 1.2 "
+            "sip media: DTLS pinned to 1.2 + ECDHE-RSA suites enabled "
             f"(pyOpenSSL={__import__('OpenSSL').__version__} "
             f"{SSL.SSLeay_version(SSL.SSLEAY_VERSION).decode()})")
     except Exception as e:
-        logger.warning(f"sip media: could not pin DTLS to 1.2: {e}")
+        logger.warning(f"sip media: could not patch DTLS context: {e}")
 
 
 _patch_dtls12_only()
@@ -192,7 +207,7 @@ DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
 # Bumped on every media-related fix — the agent startup self-check logs it,
 # so a stale deploy is obvious from the first log lines.
-SIP_BUILD = "2026-11-19.6"
+SIP_BUILD = "2026-11-19.7"
 
 
 def enable_aiortc_logging():
