@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from fractions import Fraction
 from typing import Callable, Optional
 
 import numpy as np
@@ -207,7 +208,7 @@ DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
 # Bumped on every media-related fix — the agent startup self-check logs it,
 # so a stale deploy is obvious from the first log lines.
-SIP_BUILD = "2026-11-19.7"
+SIP_BUILD = "2026-11-19.8"
 
 
 def enable_aiortc_logging():
@@ -321,7 +322,9 @@ if _HAS_AIORTC:
             )
             frame.sample_rate = SAMPLE_RATE
             frame.pts = self._timestamp
-            frame.time_base = av.Fraction(1, SAMPLE_RATE)
+            # PyAV >= 19 dropped av.Fraction — stdlib one is what aiortc
+            # itself uses everywhere.
+            frame.time_base = Fraction(1, SAMPLE_RATE)
             return frame
 
 
