@@ -215,6 +215,8 @@ class ScriptedCallHandler:
         self._stt_connected = False
         self._stt_connect_failures = 0
         self._stt_send_drop_count = 0
+        self._stt_interim_count = 0
+        self._stt_final_count = 0
         self._stt_last_reconnect_log_attempt = -1
         self._tts_cache: dict[str, bytes] = {}      # Raw PCM from disk (INT16 24kHz)
         self._ready_audio: dict[str, bytes] = {}     # Pre-resampled float32 at output rate
@@ -517,6 +519,8 @@ class ScriptedCallHandler:
         # handler would otherwise carry it over and force-timeout every
         # later call the moment it connects.
         self._stt_send_count = 0
+        self._stt_interim_count = 0
+        self._stt_final_count = 0
         self._call_active = True
 
         if not self._prepared:
@@ -1010,8 +1014,10 @@ class ScriptedCallHandler:
             dashboard.update_worker(self.worker_id, stt=f"{prefix}{transcript}")
 
         if is_final:
+            self._stt_final_count += 1
             logger.info(f"STT heard (final): '{transcript}'")
         else:
+            self._stt_interim_count += 1
             logger.debug(f"STT (interim): '{transcript}'")
             return
 
@@ -1097,7 +1103,8 @@ class ScriptedCallHandler:
 
         logger.info(
             "Scripted call handler stopped "
-            f"(STT packets sent: {self._stt_send_count}, dropped: {self._stt_send_drop_count})"
+            f"(STT packets sent: {self._stt_send_count}, dropped: {self._stt_send_drop_count}, "
+            f"transcripts interim/final: {self._stt_interim_count}/{self._stt_final_count})"
         )
 
 
