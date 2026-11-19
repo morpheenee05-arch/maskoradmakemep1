@@ -1842,6 +1842,8 @@ def register_call_handlers(application):
     application.add_handler(CommandHandler("p1stop", p1stop_command))
     application.add_handler(CallbackQueryHandler(operator_button_handler, pattern=r"^op_"))
     application.add_handler(CallbackQueryHandler(p1file_confirm_handler, pattern=r"^p1file_"))
+    from bot.commands.p1_distributed import p1_backend_pick_handler
+    application.add_handler(CallbackQueryHandler(p1_backend_pick_handler, pattern=r"^p1backend:"))
     application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), p1file_handler))
 
     logger.info("Registered call handlers")

@@ -14,6 +14,7 @@ import time
 import uuid
 
 from loguru import logger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.commands.p1_dashboard import (
     _LABEL,
@@ -228,6 +229,7 @@ async def _p1_result_loop(bot, bus, state: dict):
                                             "run_id": run_id,
                                             "script_profile": profile,
                                             "script_bundle": session.get("script_bundle"),
+                                            "backend": session.get("backend"),
                                         },
                                     })
                                     pending.add(aid)
@@ -346,12 +348,87 @@ async def _p1_result_loop(bot, bus, state: dict):
         logger.debug("p1 completion notice send failed")
 
 
+BACKEND_LABELS = {"sip": "🌐 SIP", "manual": "🖥 Manual (Chrome)"}
+
+
+class _UpdateShim:
+    """query.message exposed as effective_message/effective_chat."""
+    __slots__ = ("_update", "message")
+
+    def __init__(self, update, message):
+        object.__setattr__(self, "_update", update)
+        object.__setattr__(self, "message", message)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_update"), name)
+
+    @property
+    def effective_message(self):
+        return object.__getattribute__(self, "message")
+
+    @property
+    def effective_chat(self):
+        return object.__getattribute__(self, "message").chat
+
+
+async def p1_backend_pick_handler(update, context):
+    """Inline 🌐 SIP / 🖥 Manual choice made — launch the pending run."""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    backend = query.data.split(":", 1)[1]
+    pending = context.bot_data.pop("p1_backend_pending", None)
+    if not pending:
+        await query.edit_message_text(
+            "⚠️ Launch request expired — start the campaign again.")
+        return
+    bus = context.bot_data.get("bus")
+    if bus is None:
+        await query.edit_message_text("⚠️ Controller bus unavailable.")
+        return
+    label = BACKEND_LABELS.get(backend, backend)
+    numbers = pending["numbers"]
+    await query.edit_message_text(
+        f"{label} — dispatching {len(numbers)} number(s) to agents…")
+    shim = _UpdateShim(update, query.message)
+    await p1_distributed(
+        shim, context, bus, numbers, pending["script_profile"],
+        line_map=pending.get("line_map"),
+        campaign_name=pending.get("campaign_name"),
+        backend=backend,
+    )
+
+
 async def p1_distributed(
     update, context, bus, numbers, script_profile,
-    line_map=None, campaign_name=None,
+    line_map=None, campaign_name=None, backend=None,
 ):
     """Seed a shared queue and dispatch all agents as pull workers."""
     msg = update.effective_message
+
+    if backend is None:
+        # Temporary while SIP is new: ask which call backend to drive.
+        context.bot_data["p1_backend_pending"] = {
+            "numbers": numbers,
+            "script_profile": script_profile,
+            "line_map": line_map,
+            "campaign_name": campaign_name,
+        }
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌐 SIP", callback_data="p1backend:sip"),
+            InlineKeyboardButton("🖥 Manual", callback_data="p1backend:manual"),
+        ]])
+        name = campaign_name or "Campaign"
+        await msg.reply_text(
+            f"📞 <b>{name}</b> — <b>{len(numbers)}</b> number(s).\n"
+            "Choose the call backend:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
     try:
         agents = [a for a in await bus.list_agents()
                   if a.get("role") == "agent"]
@@ -395,6 +472,7 @@ async def p1_distributed(
         "run_id": run_id,
         "script_profile": script_profile,
         "script_bundle": script_bundle,
+        "backend": backend,
     }
     for aid in aids:
         await bus.dispatch_job(aid, {
@@ -410,6 +488,7 @@ async def p1_distributed(
     )
     session["script_bundle"] = script_bundle
     session["script_label"] = (script_bundle or {}).get("label") or script_profile
+    session["backend"] = backend
 
     status_msg = await msg.reply_text(
         format_dashboard(session, "overview"),

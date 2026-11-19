@@ -695,6 +695,15 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
     script_bundle = p.get("script_bundle")
     connect_timeout = int(p.get("connect_timeout", 30))
     ivr_timeout = int(p.get("ivr_timeout", 120))
+    backend = str(p.get("backend") or "manual").lower()
+
+    if backend == "sip":
+        try:
+            from telephony.sip.pool import SipPool
+            pool = SipPool(pool)
+            logger.info(f"[job {job_id}] p1 backend=SIP")
+        except Exception as e:
+            logger.warning(f"[job {job_id}] SIP pool unavailable ({e}) — falling back to manual Chrome backend")
 
     try:
         if run_id:

@@ -182,6 +182,7 @@ class GVWebPhone:
         self.sdp_answerer: Optional[SdpAnswerer] = None  # for in-dialog offers
         self._p_associated = ""
         self._closed = False
+        self._is_registered = False
 
     # ── plumbing ──
 
@@ -192,6 +193,10 @@ class GVWebPhone:
             self.on_event(kind, payload)
         except Exception:
             log.exception("on_event callback failed")
+
+    @property
+    def registered(self) -> bool:
+        return self._is_registered and not self._closed
 
     @property
     def _local_uri(self) -> str:
@@ -264,6 +269,7 @@ class GVWebPhone:
 
     async def close(self):
         self._closed = True
+        self._is_registered = False
         for task in (self._reader_task, self._keepalive_task,
                      self._reregister_task, self._session_refresh_task):
             if task:
@@ -292,6 +298,7 @@ class GVWebPhone:
             pass
         except Exception as e:
             log.warning("SIP reader ended: %s", e)
+            self._is_registered = False
             self._emit("transport_lost", {"error": str(e)})
 
     async def _keepalive(self):
@@ -342,6 +349,7 @@ class GVWebPhone:
         m = re.search(r"expires=(\d+)", contact)
         if m:
             self._reg_expires = int(m.group(1))
+        self._is_registered = True
         self._reregister_task = asyncio.create_task(self._reregister_loop())
         self._emit("registered", {"expires": self._reg_expires,
                                   "p_associated": bool(self._p_associated)})

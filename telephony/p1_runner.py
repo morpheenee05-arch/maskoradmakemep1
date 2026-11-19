@@ -287,6 +287,7 @@ async def _execute_one_body(
                 playback_device=gv_client.playback_device,
                 worker_id=gv_client.worker_id,
                 scripts=scripts,
+                audio_manager=getattr(gv_client, "sip_audio", None),
             )
             if not await handler.initialize():
                 _diag_set(why="audio_init_failed", elapsed_s=round(time.monotonic() - t0, 1))

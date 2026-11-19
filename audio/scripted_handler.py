@@ -192,6 +192,7 @@ class ScriptedCallHandler:
         playback_device: str,
         worker_id: int = -1,
         scripts: dict | None = None,
+        audio_manager=None,
     ):
         """Prepare IVR manager for a specific profile (voicemail mode) on a specific worker."""
         self.profile = profile
@@ -199,7 +200,7 @@ class ScriptedCallHandler:
 
         # Built-in, operator-made (disk), or an explicit bundle from the controller.
         self._scripts = scripts or resolve_profile(profile)
-        self.audio = AudioManager(capture_device=capture_device, playback_device=playback_device)
+        self.audio = audio_manager or AudioManager(capture_device=capture_device, playback_device=playback_device)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._result: Optional[str] = None
         self._result_event = asyncio.Event()
