@@ -58,9 +58,15 @@ def enable_aiortc_logging():
             except Exception:
                 pass
 
-    level = logging.DEBUG if os.getenv("SIP_MEDIA_DEBUG") else logging.INFO
+    # aiortc always at DEBUG: DTLS failure reasons (fingerprint mismatch,
+    # no SRTP profile, SSL error text) are only logged there, and the
+    # per-call volume is small. aioice stays INFO (its per-check lines are
+    # noisy enough); SIP_MEDIA_DEBUG=1 unlocks its DEBUG too.
     handler = _LoguruHandler()
-    for name in ("aiortc", "aioice"):
+    for name, level in (
+        ("aiortc", logging.DEBUG),
+        ("aioice", logging.DEBUG if os.getenv("SIP_MEDIA_DEBUG") else logging.INFO),
+    ):
         lg = logging.getLogger(name)
         lg.setLevel(level)
         if handler not in lg.handlers:
