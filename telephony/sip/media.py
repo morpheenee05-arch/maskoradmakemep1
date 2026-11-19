@@ -39,6 +39,45 @@ try:
 except ImportError:  # pragma: no cover - depends on agent env
     _HAS_AIORTC = False
 
+
+def _patch_dtls12_only():
+    """Pin the DTLS handshake to version 1.2.
+
+    OpenSSL 3.2+ enables DTLS 1.3 and offers it in the ClientHello by
+    default. Google's media servers answer that with a fatal alert instead
+    of a version fallback, which surfaces as aiortc's
+    'x DTLS handshake failed (error [])' right after ICE completes.
+    WebRTC requires only DTLS 1.2, so capping both bounds is safe.
+    pyOpenSSL exposes no DTLS version constants — 0xFEFD is DTLS 1.2.
+    """
+    if not _HAS_AIORTC:
+        return
+    try:
+        from OpenSSL import SSL
+        from aiortc.rtcdtlstransport import RTCCertificate
+        if getattr(RTCCertificate._create_ssl_context, "_dtls12_pinned", False):
+            return
+        orig = RTCCertificate._create_ssl_context
+        DTLS1_2 = 0xFEFD
+
+        def patched(self, srtp_profiles):
+            ctx = orig(self, srtp_profiles)
+            ctx.set_min_proto_version(DTLS1_2)
+            ctx.set_max_proto_version(DTLS1_2)
+            return ctx
+
+        patched._dtls12_pinned = True
+        RTCCertificate._create_ssl_context = patched
+        logger.info(
+            "sip media: DTLS pinned to 1.2 "
+            f"(pyOpenSSL={__import__('OpenSSL').__version__} "
+            f"{SSL.SSLeay_version(SSL.SSLEAY_VERSION).decode()})")
+    except Exception as e:
+        logger.warning(f"sip media: could not pin DTLS to 1.2: {e}")
+
+
+_patch_dtls12_only()
+
 import os
 
 # ICE never converges without STUN (host candidates only) — Chrome's web
@@ -47,7 +86,7 @@ DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
 # Bumped on every media-related fix — the agent startup self-check logs it,
 # so a stale deploy is obvious from the first log lines.
-SIP_BUILD = "2026-11-19.4"
+SIP_BUILD = "2026-11-19.5"
 
 
 def enable_aiortc_logging():
@@ -249,9 +288,15 @@ class SipMediaSession:
     # ── audio in ──
 
     async def _reader(self, track):
+        frames = 0
         try:
             while not self._closed:
                 frame = await track.recv()
+                frames += 1
+                if frames == 1:
+                    logger.info(
+                        "sip media: remote audio flowing "
+                        "(first inbound frame — far end is being heard)")
                 try:
                     arr = frame.to_ndarray()          # (ch, n) — s16 or fltp
                 except Exception:
