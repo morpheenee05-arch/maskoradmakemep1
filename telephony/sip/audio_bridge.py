@@ -9,7 +9,7 @@ Same public surface the ScriptedCallHandler touches:
 
 Instead of capture/playback subprocesses it talks to the active
 telephony.sip.media.SipMediaSession of the owning SipPhoneClient:
-  remote opus  → 48k float32 → resample to 24k → callback + recorder
+  remote opus  → 48k float32 → resample to 24k → int16 → callback + recorder
   play_raw     → 48k float32 → SipMediaSession.push_pcm (opus → SRTP)
 
 The handler works at 24kHz on capture (Deepgram rate) and at the device
@@ -41,6 +41,7 @@ class SipAudioManager:
         self._sounds: dict[str, bytes] = {}
         self._id_lock = threading.Lock()
         self._playback_id = 0
+        self._logged_first_audio = False
 
     # ── session binding (per call) ──
 
@@ -61,12 +62,17 @@ class SipAudioManager:
     # ── remote audio (from SIP media) ──
 
     def _on_remote_audio(self, pcm48: bytes):
-        """float32 48k mono from the SIP stack → 24k for the handler."""
+        """float32 48k mono from the SIP stack → int16 24k for the handler."""
         if not self._running:
             return
         arr = np.frombuffer(pcm48, dtype=np.float32)
         dg = resample(arr, OUTPUT_RATE, CAPTURE_RATE)
-        data = dg.tobytes()
+        # Handler (STT linear16 / DTMF) and CallRecorder both expect int16.
+        data = (np.clip(dg, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        if not self._logged_first_audio:
+            self._logged_first_audio = True
+            rms = float(np.sqrt(np.mean(dg * dg))) if dg.size else 0.0
+            logger.info(f"sip bridge: first remote audio → handler (rms={rms:.4f})")
         if self._recorder is not None:
             try:
                 self._recorder.append_remote(data)
@@ -96,6 +102,7 @@ class SipAudioManager:
 
     def start(self):
         self._running = True
+        self._logged_first_audio = False
 
     def set_recorder(self, recorder) -> None:
         self._recorder = recorder
