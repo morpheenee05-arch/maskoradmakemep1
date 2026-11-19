@@ -272,7 +272,11 @@ if _HAS_AIORTC:
 
         def __init__(self):
             super().__init__()
-            self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=250)
+            # 20 ms frames: 3000 = 60 s of buffered audio. The IVR pushes a
+            # whole clip at once (intro ~19 s); a 250-frame (5 s) buffer made
+            # push() drop everything but the clip's tail, so the callee heard
+            # ~5 s of mid-phrase audio then silence and hung up.
+            self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=3000)
             self._leftover = b""
             self._start: Optional[float] = None
             self._timestamp = 0
