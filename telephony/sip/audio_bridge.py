@@ -42,6 +42,9 @@ class SipAudioManager:
         self._id_lock = threading.Lock()
         self._playback_id = 0
         self._logged_first_audio = False
+        self._logged_voice = False
+        self._audio_chunks = 0
+        self._audio_max_rms = 0.0
 
     # ── session binding (per call) ──
 
@@ -69,10 +72,21 @@ class SipAudioManager:
         dg = resample(arr, OUTPUT_RATE, CAPTURE_RATE)
         # Handler (STT linear16 / DTMF) and CallRecorder both expect int16.
         data = (np.clip(dg, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        rms = float(np.sqrt(np.mean(dg * dg))) if dg.size else 0.0
+        self._audio_chunks += 1
+        if rms > self._audio_max_rms:
+            self._audio_max_rms = rms
         if not self._logged_first_audio:
             self._logged_first_audio = True
-            rms = float(np.sqrt(np.mean(dg * dg))) if dg.size else 0.0
             logger.info(f"sip bridge: first remote audio → handler (rms={rms:.4f})")
+        if rms > 0.005 and not self._logged_voice:
+            self._logged_voice = True
+            logger.info(
+                f"sip bridge: far end AUDIBLE (rms={rms:.4f}) — remote voice reaching handler")
+        if self._audio_chunks % 100 == 0:
+            logger.info(
+                f"sip bridge: remote audio chunks={self._audio_chunks} "
+                f"max_rms={self._audio_max_rms:.4f}")
         if self._recorder is not None:
             try:
                 self._recorder.append_remote(data)
@@ -103,6 +117,9 @@ class SipAudioManager:
     def start(self):
         self._running = True
         self._logged_first_audio = False
+        self._logged_voice = False
+        self._audio_chunks = 0
+        self._audio_max_rms = 0.0
 
     def set_recorder(self, recorder) -> None:
         self._recorder = recorder
@@ -183,5 +200,9 @@ class SipAudioManager:
         self.play_raw(audio.tobytes())
 
     def stop(self):
+        if self._running and self._audio_chunks:
+            logger.info(
+                f"sip bridge: call audio summary chunks={self._audio_chunks} "
+                f"max_rms={self._audio_max_rms:.4f} voice_heard={self._logged_voice}")
         self._running = False
         self.detach_session()
