@@ -44,11 +44,11 @@ def _patch_dtls12_only():
     """Pin the DTLS handshake to version 1.2.
 
     OpenSSL 3.2+ enables DTLS 1.3 and offers it in the ClientHello by
-    default. Google's media servers answer that with a fatal alert instead
-    of a version fallback, which surfaces as aiortc's
-    'x DTLS handshake failed (error [])' right after ICE completes.
-    WebRTC requires only DTLS 1.2, so capping both bounds is safe.
-    pyOpenSSL exposes no DTLS version constants — 0xFEFD is DTLS 1.2.
+    default; Google's media servers predate it, so we stay on the version
+    Chrome's WebRTC uses. (Kept even though it did NOT resolve the
+    'x DTLS handshake failed (error [])' failure — the wire dump below is
+    the diagnostic for that.) pyOpenSSL exposes no DTLS version constants —
+    0xFEFD is DTLS 1.2.
     """
     if not _HAS_AIORTC:
         return
@@ -78,6 +78,112 @@ def _patch_dtls12_only():
 
 _patch_dtls12_only()
 
+
+_DTLS_ALERTS = {
+    20: "close_notify", 21: "unexpected_message", 22: "bad_record_mac",
+    40: "handshake_failure", 42: "bad_certificate",
+    43: "unsupported_certificate", 44: "certificate_revoked",
+    45: "certificate_expired", 46: "certificate_unknown",
+    47: "illegal_parameter", 48: "unknown_ca", 49: "access_denied",
+    50: "decode_error", 51: "decrypt_error", 70: "protocol_version",
+    71: "insufficient_security", 80: "internal_error",
+    86: "inappropriate_fallback", 90: "user_canceled",
+    109: "missing_extension", 110: "unsupported_extension",
+    112: "unrecognized_name", 113: "bad_certificate_status_response",
+    115: "unknown_psk_identity", 116: "certificate_required",
+    120: "no_application_protocol",
+}
+
+_DTLS_HANDSHAKES = {
+    0: "hello_request", 1: "client_hello", 2: "server_hello",
+    3: "hello_verify_request", 4: "new_session_ticket",
+    8: "encrypted_extensions", 11: "certificate",
+    12: "server_key_exchange", 13: "certificate_request",
+    14: "server_hello_done", 15: "certificate_verify",
+    16: "client_key_exchange", 20: "finished",
+}
+
+
+def _describe_dtls(direction: str, data: bytes) -> str:
+    """Human-readable one-liner for a DTLS record (RFC 7983 demuxed)."""
+    ct = data[0]
+    ver = f"{data[1]:02x}{data[2]:02x}"
+    epoch = int.from_bytes(data[3:5], "big")
+    body = data[13:]
+    parts = [
+        f"{direction} len={len(data)} type={ct} ver={ver} epoch={epoch}"
+    ]
+    full_hex = False
+    if ct == 21 and len(body) >= 2:  # alert — the answer we are looking for
+        parts.append(
+            f"ALERT level={body[0]} desc={body[1]}"
+            f"({_DTLS_ALERTS.get(body[1], '?')})")
+        full_hex = True
+    elif ct == 22 and len(body) >= 4:  # handshake
+        ht = body[0]
+        hlen = int.from_bytes(body[1:4], "big")
+        parts.append(f"handshake={_DTLS_HANDSHAKES.get(ht, ht)} hlen={hlen}")
+        if ht == 3 and len(body) >= 7:  # HelloVerifyRequest → cookie size
+            parts.append(f"cookie_len={body[6]}")
+        full_hex = ht in (1, 2, 3)  # client/server hello in full
+    limit = len(data) if full_hex else 48
+    parts.append(f"hex={data[:limit].hex()}")
+    return " ".join(parts)
+
+
+def _patch_dtls_wire_dump():
+    """Hexdump DTLS datagrams on the wire (first 40 per connection).
+
+    Google's media server kills our handshake with a bare SSL.Error — the
+    only way to see *why* is to look at what it actually sends back
+    (alert? HelloVerifyRequest? garbage?). Logs via loguru INFO so the
+    agent's sink keeps them.
+    """
+    if not _HAS_AIORTC:
+        return
+    try:
+        from aioice.ice import Connection
+        if getattr(Connection.send, "_dtls_dump", False):
+            return
+        orig_send = Connection.send
+        orig_recv = Connection.recv
+        counts: dict = {}
+
+        def _is_dtls(data: bytes) -> bool:
+            return (
+                len(data) > 13
+                and 20 <= data[0] <= 24      # ccs/alert/handshake/appdata
+                and data[1] == 0xFE          # DTLS version family
+            )
+
+        def _allow(conn) -> bool:
+            n = counts.get(id(conn), 0)
+            if n >= 40:
+                return False
+            counts[id(conn)] = n + 1
+            return True
+
+        async def send_dump(self, data: bytes) -> None:
+            if _is_dtls(data) and _allow(self):
+                logger.info(f"sip dtls-wire {_describe_dtls('tx', data)}")
+            return await orig_send(self, data)
+
+        async def recv_dump(self) -> bytes:
+            data = await orig_recv(self)
+            if _is_dtls(data) and _allow(self):
+                logger.info(f"sip dtls-wire {_describe_dtls('rx', data)}")
+            return data
+
+        send_dump._dtls_dump = True
+        Connection.send = send_dump
+        Connection.recv = recv_dump
+        logger.info("sip media: DTLS wire dump enabled (40 datagrams/call)")
+    except Exception as e:
+        logger.warning(f"sip media: could not enable DTLS wire dump: {e}")
+
+
+_patch_dtls_wire_dump()
+
 import os
 
 # ICE never converges without STUN (host candidates only) — Chrome's web
@@ -86,7 +192,7 @@ DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
 # Bumped on every media-related fix — the agent startup self-check logs it,
 # so a stale deploy is obvious from the first log lines.
-SIP_BUILD = "2026-11-19.5"
+SIP_BUILD = "2026-11-19.6"
 
 
 def enable_aiortc_logging():
