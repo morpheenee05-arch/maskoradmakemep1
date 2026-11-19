@@ -151,7 +151,10 @@ class VoiceAPIClient:
             "Cookie": self._cookie_header(),
             "Content-Type": "application/json+protobuf",
             "Accept": "*/*",
-            "Origin": AUTH_ORIGIN,
+            # XD3 check: Origin must match the Host (clients6.google.com) —
+            # proven by full_capture.har. The SAPISIDHASH input origin stays
+            # voice.google.com (proven by the live sniff).
+            "Origin": "https://clients6.google.com",
             "Referer": GAPI_PROXY_REFERER,
             "X-Origin": ORIGIN,
             "X-Referer": ORIGIN,
