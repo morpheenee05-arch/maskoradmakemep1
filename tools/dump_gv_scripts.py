@@ -38,6 +38,7 @@ def main():
 
     import config
     import undetected_chromedriver as uc
+    from selenium.webdriver.chrome.service import Service
 
     profile_dir = config.BASE_DIR / f".chrome_profile_{args.worker}"
     if not profile_dir.exists():
@@ -52,9 +53,21 @@ def main():
     options.add_argument("--disable-gpu")
     options.add_argument("--no-first-run")
     options.add_argument("--window-size=1280,900")
+    options.page_load_strategy = "eager"
 
+    driver_path = config.resolve_chromedriver_path()
+    service = Service(executable_path=str(driver_path),
+                      port=19600 + args.worker,
+                      service_args=["--host=127.0.0.1"])
     log.info("spawning Chrome on %s …", profile_dir.name)
-    drv = uc.Chrome(options=options)
+    drv = uc.Chrome(
+        options=options,
+        service=service,
+        driver_executable_path=str(driver_path),
+        use_subprocess=True,
+        version_main=config.resolve_chrome_version_main(),
+        keep_alive=True,
+    )
     outdir = Path("captures/js") / time.strftime("%Y%m%d_%H%M%S")
     outdir.mkdir(parents=True, exist_ok=True)
     try:
