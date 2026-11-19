@@ -433,12 +433,16 @@ class SipMediaSession:
                     continue
                 if arr.size == 0:
                     continue
-                if arr.ndim == 2:
-                    arr = arr.mean(axis=0)
+                # Normalize BEFORE downmix: mean() on int16 promotes to
+                # float64 while keeping the ±32768 scale, so the dtype check
+                # must happen first or the samples stay int16-scaled floats
+                # (and get hard-clipped to a square wave downstream).
                 if arr.dtype == np.int16:
                     arr = arr.astype(np.float32) / 32768.0
                 else:
                     arr = arr.astype(np.float32)
+                if arr.ndim == 2:
+                    arr = arr.mean(axis=0, dtype=np.float32)
                 rate = frame.sample_rate or SAMPLE_RATE
                 if rate != SAMPLE_RATE:
                     from audio.engine import resample
