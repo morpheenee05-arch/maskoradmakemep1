@@ -361,31 +361,53 @@ async def _handle_sip_test_job(pool, bus, job: dict):
                 drv = worker.driver
                 drv.execute_script(PCC_HOOK_JS)
                 drv.execute_script(
-                    "window.__pccArm = true; window.__pccCapture = null;")
+                    "window.__pccArm = true; window.__pccCapture = null;"
+                    "window.__pccKeys = []; window.__pccPlain = [];")
                 try:
                     res = drv.execute_async_script(PCC_DIAL_JS, call_number)
+                    cap = drv.execute_script(
+                        "return {cap: window.__pccCapture || null,"
+                        " keys: window.__pccKeys || [],"
+                        " plain: window.__pccPlain || []};") or {}
                 finally:
                     drv.execute_script("window.__pccArm = false;")
+                res = res or {}
+                res["capture"] = cap
                 return res
 
             pcc = None
             try:
                 res = await asyncio.to_thread(_mint_pcc)
-                if res and res.get("ok"):
-                    cap = await asyncio.to_thread(
-                        lambda: worker.driver.execute_script(
-                            "return window.__pccCapture || null"))
-                    if cap and cap.get("header"):
-                        pcc = cap["header"]
+                cap = (res or {}).get("capture") or {}
+                pcc_keys = cap.get("keys") or []
+                pcc_plain = cap.get("plain") or []
+                if res.get("ok") and (cap.get("cap") or {}).get("header"):
+                    pcc = cap["cap"]["header"]
                 if pcc:
                     stages["pcc"] = {"ok": True, "len": len(pcc)}
                     await progress(
                         "call", f"PlaceCallContext minted ({len(pcc)} chars)")
                 else:
-                    detail = "; ".join((res or {}).get("log") or [])[:300]
+                    detail = "; ".join(res.get("log") or [])[:300]
                     stages["pcc"] = {"ok": False, "log": detail}
                     await progress(
                         "call", f"PlaceCallContext mint failed: {detail}")
+                # reverse-engineering gold: key halves + plaintext as seen
+                # by WebCrypto — goes into the .log for offline analysis
+                if pcc_keys or pcc_plain:
+                    import base64 as _b64
+                    stages["pcc_debug"] = {
+                        "keys": pcc_keys,
+                        "plaintext": [
+                            _b64.b64decode(p.get("data", "")).decode(
+                                "utf-8", "replace")[:4000]
+                            for p in pcc_plain
+                        ],
+                    }
+                    await progress(
+                        "call",
+                        f"pcc debug: {len(pcc_keys)} key imports, "
+                        f"{len(pcc_plain)} plaintexts captured")
             except Exception as e:
                 stages["pcc"] = {"ok": False, "error": str(e)[:300]}
                 await progress("call", f"PlaceCallContext mint error: {e}")

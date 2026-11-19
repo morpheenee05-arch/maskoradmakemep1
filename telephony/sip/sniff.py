@@ -129,6 +129,45 @@ PCC_HOOK_JS = r"""
   window.__pccHooked = true;
   window.__pccArm = false;
   window.__pccCapture = null;
+  window.__pccKeys = [];
+  window.__pccPlain = [];
+
+  // ── WebCrypto hooks: grab the 64-byte key halves and the plaintext ──
+  // The app builds a fresh Tink AES-CTR-HMAC crypter per call:
+  //   importKey(raw, 32B, AES-CTR) + importKey(raw, 32B, HMAC/SHA-256),
+  //   then subtle.encrypt(AES-CTR, key, plaintextBytes).
+  try {
+    var _ik = crypto.subtle.importKey.bind(crypto.subtle);
+    crypto.subtle.importKey = function (format, keyData, alg, extractable, usages) {
+      try {
+        if (format === 'raw' && keyData) {
+          var name = (alg && alg.name) || '';
+          if (name === 'AES-CTR' || name === 'HMAC') {
+            var bytes = new Uint8Array(keyData);
+            var bin = '';
+            for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+            window.__pccKeys.push({
+              alg: name, hash: (alg.hash && alg.hash.name) || '',
+              key: btoa(bin), ts: Date.now(),
+            });
+          }
+        }
+      } catch (e) {}
+      return _ik(format, keyData, alg, extractable, usages);
+    };
+    var _enc = crypto.subtle.encrypt.bind(crypto.subtle);
+    crypto.subtle.encrypt = function (alg, key, data) {
+      try {
+        if (alg && alg.name === 'AES-CTR' && data) {
+          var bytes = new Uint8Array(data);
+          var bin = '';
+          for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+          window.__pccPlain.push({ data: btoa(bin), ts: Date.now() });
+        }
+      } catch (e) {}
+      return _enc(alg, key, data);
+    };
+  } catch (e) {}
 
   function fake603(invite) {
     function h(name) {

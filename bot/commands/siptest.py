@@ -184,11 +184,15 @@ def _build_log_file(aid: str, jid: str, call: str, stages: dict,
         "",
         "── stages ──",
     ]
-    for name in _STAGE_ORDER:
-        if name in stages:
-            # plain-text stage line (strip HTML tags used in chat rendering)
-            import re as _re
-            head.append(_re.sub(r"<[^>]+>", "", _stage_line(name, stages[name])))
+    import re as _re
+    ordered = [n for n in _STAGE_ORDER if n in stages]
+    ordered += [n for n in stages if n not in _STAGE_ORDER]
+    for name in ordered:
+        data = stages[name]
+        if name in _STAGE_TITLE or name == "worker":
+            head.append(_re.sub(r"<[^>]+>", "", _stage_line(name, data)))
+        else:
+            head.append(f"{name}: {data}")
     body = ["", "── live progress ──"] + (log_lines or ["(none)"])
     events = ["", "── events ──"]
     if done:
