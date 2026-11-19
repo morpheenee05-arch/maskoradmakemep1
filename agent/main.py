@@ -696,14 +696,27 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
     connect_timeout = int(p.get("connect_timeout", 30))
     ivr_timeout = int(p.get("ivr_timeout", 120))
     backend = str(p.get("backend") or "manual").lower()
+    backend_used = "manual"
 
     if backend == "sip":
         try:
             from telephony.sip.pool import SipPool
             pool = SipPool(pool)
+            backend_used = "sip"
             logger.info(f"[job {job_id}] p1 backend=SIP")
         except Exception as e:
             logger.warning(f"[job {job_id}] SIP pool unavailable ({e}) — falling back to manual Chrome backend")
+            try:
+                await bus.publish_result({
+                    "job_id": job_id, "run_id": run_id, "agent_id": aid,
+                    "kind": "p1_backend",
+                    "backend": "manual",
+                    "warning": f"SIP unavailable ({e}) — fell back to Manual Chrome",
+                })
+            except Exception:
+                pass
+    else:
+        logger.info(f"[job {job_id}] p1 backend=MANUAL (Chrome)")
 
     try:
         if run_id:
@@ -792,6 +805,7 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
             "counts": report.get("counts", {}),
             "done": report.get("done", 0),
             "stopped": stop_event.is_set(),
+            "backend": backend_used,
         })
         logger.info(f"[job {job_id}] p1 done {report.get('counts')}")
     except Exception as e:

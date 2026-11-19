@@ -150,9 +150,38 @@ async def _p1_result_loop(bot, bus, state: dict):
                             await send_p1_audio_from_bus(bot, chat_id, r)
                         except Exception as e:
                             logger.debug(f"p1_audio send failed: {e}")
+                    elif kind == "p1_backend":
+                        warn = r.get("warning")
+                        if warn:
+                            try:
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"⚠️ {aid}: {warn}",
+                                )
+                            except Exception:
+                                pass
                     elif kind == "p1_done":
                         pending.discard(aid)
                         record_agent_done(session, aid)
+                        # Backend honesty check: if we asked for SIP but the
+                        # agent didn't confirm it (old agent code ignores the
+                        # param silently), say so once per agent.
+                        if session.get("backend") == "sip" \
+                                and r.get("backend") != "sip":
+                            warned = state.setdefault("_backend_warned", set())
+                            if aid not in warned:
+                                warned.add(aid)
+                                try:
+                                    await bot.send_message(
+                                        chat_id=chat_id,
+                                        text=(
+                                            f"⚠️ {aid}: запрошен 🌐 SIP, но звонки "
+                                            "пошли через 🖥 Chrome — агент не "
+                                            "подтвердил SIP (старый код на агенте?)"
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
                         # Per-agent completion breakdown — shows exactly what one
                         # server produced (incl. its own cancelled count) so we
                         # can tell a misbehaving agent from an expected stop.
