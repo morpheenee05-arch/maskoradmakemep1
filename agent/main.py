@@ -925,10 +925,10 @@ def _sip_selfcheck():
     """
     try:
         from telephony.sip.pool import SipPool  # noqa: F401
-        from telephony.sip.media import _HAS_AIORTC, enable_aiortc_logging
+        from telephony.sip.media import _HAS_AIORTC, SIP_BUILD, enable_aiortc_logging
         enable_aiortc_logging()
         if _HAS_AIORTC:
-            logger.info("SIP backend: READY (aiortc OK)")
+            logger.info(f"SIP backend: READY (aiortc OK, build {SIP_BUILD})")
         else:
             logger.warning(
                 "SIP backend: aiortc NOT installed — run "

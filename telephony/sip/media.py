@@ -45,6 +45,10 @@ import os
 # client uses Google's own STUN. Override via SIP_STUN_SERVERS="stun:host:port,...".
 DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
+# Bumped on every media-related fix — the agent startup self-check logs it,
+# so a stale deploy is obvious from the first log lines.
+SIP_BUILD = "2026-11-19.4"
+
 
 def enable_aiortc_logging():
     """Forward aiortc/aioice records into loguru so ICE/DTLS failure
@@ -54,7 +58,14 @@ def enable_aiortc_logging():
     class _LoguruHandler(logging.Handler):
         def emit(self, record):
             try:
-                logger.log(record.levelname, f"{record.name}: {record.getMessage()}")
+                msg = record.getMessage()
+                level = record.levelname
+                # The agent's loguru sink usually filters DEBUG out — but
+                # aiortc reports every failure reason at DEBUG only ("x ..."
+                # is its error marker). Escalate those so they survive.
+                if level == "DEBUG" and (msg.startswith("x ") or "DTLS" in msg):
+                    level = "INFO"
+                logger.log(level, f"{record.name}: {msg}")
             except Exception:
                 pass
 
