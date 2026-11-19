@@ -917,12 +917,37 @@ def _log_memory_report(pool, interval_sec: int = 300):
     )
 
 
+def _sip_selfcheck():
+    """Log at startup whether the SIP backend can actually run here.
+
+    Catches broken/partial deploys (missing aiortc, stale telephony/sip
+    files) BEFORE a campaign silently falls back to Manual Chrome.
+    """
+    try:
+        from telephony.sip.pool import SipPool  # noqa: F401
+        from telephony.sip.media import _HAS_AIORTC
+        if _HAS_AIORTC:
+            logger.info("SIP backend: READY (aiortc OK)")
+        else:
+            logger.warning(
+                "SIP backend: aiortc NOT installed — run "
+                "'py -3 -m pip install aiortc av'; SIP campaigns will "
+                "fall back to Manual Chrome"
+            )
+    except Exception as e:
+        logger.warning(
+            f"SIP backend: UNAVAILABLE ({e}) — check the telephony/sip "
+            "deploy; SIP campaigns will fall back to Manual Chrome"
+        )
+
+
 async def _init_pool(pool) -> bool:
     attempts = max(1, config.GV_INIT_RETRY_COUNT)
     delay = max(5, config.GV_INIT_RETRY_DELAY_SEC)
     for attempt in range(1, attempts + 1):
         if await pool.initialize():
             logger.info(f"Agent pool ready (attempt {attempt}/{attempts})")
+            _sip_selfcheck()
             return True
         if attempt < attempts:
             logger.warning(
