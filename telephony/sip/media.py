@@ -130,6 +130,12 @@ def _describe_dtls(direction: str, data: bytes) -> str:
         f"{direction} len={len(data)} type={ct} ver={ver} epoch={epoch}"
     ]
     full_hex = False
+    if epoch > 0:
+        # post-handshake records are encrypted — decoding the payload as
+        # plaintext alert/handshake types only produces garbage
+        parts.append("(encrypted)")
+        parts.append(f"hex={data[:48].hex()}")
+        return " ".join(parts)
     if ct == 21 and len(body) >= 2:  # alert — the answer we are looking for
         parts.append(
             f"ALERT level={body[0]} desc={body[1]}"
