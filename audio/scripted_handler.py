@@ -869,7 +869,7 @@ class ScriptedCallHandler:
             except (asyncio.CancelledError, Exception):
                 pass
         self._stt_recv_task = asyncio.create_task(self._stt_recv_loop(ws))
-        logger.debug("STT websocket connected")
+        logger.info("STT websocket connected")
         return True
 
     async def _stt_keep_alive_loop(self):
@@ -892,10 +892,18 @@ class ScriptedCallHandler:
                     # kills an idle socket after ~10s (net1011), and the
                     # reconnect churn lands exactly on the next call's
                     # greeting window — voicemails were being misclassified
-                    # as timeouts. 20ms every ~4s is ~0.5% duty cycle
-                    # (negligible billing) and keeps the socket warm.
-                    if self._stt_connected and self._stt_q.qsize() < 2:
-                        self._queue_stt_audio(idle_silence)
+                    # as timeouts. Deepgram's protocol-level KeepAlive is
+                    # free (no audio billing); 20ms silence every ~4s is
+                    # the fallback for models that ignore it.
+                    if self._stt_connected:
+                        ws = self._stt_ws
+                        if ws is not None:
+                            try:
+                                await ws.send('{"type": "KeepAlive"}')
+                            except Exception:
+                                pass
+                        if self._stt_q.qsize() < 2:
+                            self._queue_stt_audio(idle_silence)
                     await asyncio.sleep(4.0)
         except asyncio.CancelledError:
             pass
