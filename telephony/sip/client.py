@@ -131,6 +131,17 @@ class SipPhoneClient:
                 if ev is not None:
                     ev.set()
 
+    def _on_media_state(self, state: str):
+        # ICE/DTLS failure or close mid-call = dead audio — treat as ended
+        # so the hangup monitor stops the IVR script instead of playing the
+        # whole script into dead air.
+        if state in ("failed", "closed") and self._state in ("calling", "active"):
+            logger.warning(f"sip W{self.worker_id}: media {state} — marking call ended")
+            self._state = "ended"
+            for ev in (self._answered_ev, self._end_ev):
+                if ev is not None:
+                    ev.set()
+
     async def _apply_answer(self, sdp: str):
         media = self._media
         if media is None:
@@ -146,7 +157,7 @@ class SipPhoneClient:
         try:
             await self._ensure_registered()
             try:
-                media = SipMediaSession()
+                media = SipMediaSession(on_state=self._on_media_state)
             except AiortcMissingError as e:
                 logger.error(str(e))
                 return False

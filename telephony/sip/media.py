@@ -30,6 +30,7 @@ try:
     import av
     from aiortc import (
         RTCConfiguration,
+        RTCIceServer,
         RTCPeerConnection,
         RTCSessionDescription,
     )
@@ -37,6 +38,12 @@ try:
     _HAS_AIORTC = True
 except ImportError:  # pragma: no cover - depends on agent env
     _HAS_AIORTC = False
+
+import os
+
+# ICE never converges without STUN (host candidates only) — Chrome's web
+# client uses Google's own STUN. Override via SIP_STUN_SERVERS="stun:host:port,...".
+DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
 SAMPLE_RATE = 48000
 SAMPLES_PER_FRAME = 960          # 20 ms @ 48 kHz
@@ -131,7 +138,12 @@ class SipMediaSession:
             raise AiortcMissingError()
         self.on_audio = on_audio
         self.on_state = on_state
-        config = RTCConfiguration(iceServers=ice_servers or [])
+        if ice_servers is None:
+            ice_servers = [
+                RTCIceServer(urls=[u.strip()])
+                for u in DEFAULT_STUN.split(",") if u.strip()
+            ]
+        config = RTCConfiguration(iceServers=ice_servers)
         self.pc = RTCPeerConnection(configuration=config)
         self._out_track = _PcmQueueTrack()
         self._recv_task: Optional[asyncio.Task] = None
