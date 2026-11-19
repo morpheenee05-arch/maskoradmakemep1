@@ -466,14 +466,19 @@ class GVWebPhone:
         if not d:
             return
         self._pending.pop(d.invite_branch, None)
-        if d.answered:
-            await self._send_in_dialog("BYE")
-        else:
-            # cancel the pending INVITE
-            d.cseq += 1
-            msg = self._dialog_request("CANCEL")
-            msg.headers.append(("Reason", 'SIP ;cause=487 ;text="Cancelled"'))
-            await self._send(msg)
+        try:
+            if d.answered:
+                await self._send_in_dialog("BYE")
+            else:
+                # cancel the pending INVITE
+                d.cseq += 1
+                msg = self._dialog_request("CANCEL")
+                msg.headers.append(("Reason", 'SIP ;cause=487 ;text="Cancelled"'))
+                await self._send(msg)
+        finally:
+            # The dialog is over once BYE/CANCEL is on the wire — keeping it
+            # blocked every later start_call with "call already in progress".
+            self.dialog = None
         self._emit("hangup_sent", {})
 
     # ── response handling ──

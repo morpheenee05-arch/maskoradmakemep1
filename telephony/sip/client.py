@@ -132,11 +132,12 @@ class SipPhoneClient:
                     ev.set()
 
     def _on_media_state(self, state: str):
-        # ICE/DTLS failure or close mid-call = dead audio — treat as ended
-        # so the hangup monitor stops the IVR script instead of playing the
-        # whole script into dead air.
-        if state in ("failed", "closed") and self._state in ("calling", "active"):
-            logger.warning(f"sip W{self.worker_id}: media {state} — marking call ended")
+        # ICE/DTLS failure mid-call = dead audio — treat as ended so the
+        # hangup monitor stops the IVR script instead of playing the whole
+        # script into dead air. ("closed" is NOT an error — it fires from our
+        # own teardown in _teardown_media.)
+        if state == "failed" and self._state in ("calling", "active"):
+            logger.warning(f"sip W{self.worker_id}: media failed — marking call ended")
             self._state = "ended"
             for ev in (self._answered_ev, self._end_ev):
                 if ev is not None:
@@ -156,6 +157,13 @@ class SipPhoneClient:
     async def make_call(self, phone: str, call_id: str) -> bool:
         try:
             await self._ensure_registered()
+            # Defensive: a stale dialog from a previous call must never block
+            # this one ("call already in progress" storm).
+            if self._phone is not None and getattr(self._phone, "dialog", None) is not None:
+                try:
+                    await self._phone.hangup()
+                except Exception:
+                    pass
             try:
                 media = SipMediaSession(on_state=self._on_media_state)
             except AiortcMissingError as e:
@@ -169,10 +177,20 @@ class SipPhoneClient:
             offer = await media.create_offer()
             await self._phone.start_call(phone, offer)
             self._active_calls[call_id] = phone
+            self._fail_streak = 0
             return True
         except Exception as e:
             logger.warning(f"sip W{self.worker_id}: make_call failed: {e}")
             await self._teardown_media()
+            # Back off on consecutive failures — a fast-failing client must
+            # not burn the whole number queue in seconds.
+            self._fail_streak = getattr(self, "_fail_streak", 0) + 1
+            if self._fail_streak >= 3:
+                backoff = min(2 * self._fail_streak, 15)
+                logger.warning(
+                    f"sip W{self.worker_id}: {self._fail_streak} consecutive "
+                    f"make_call failures — backing off {backoff}s")
+                await asyncio.sleep(backoff)
             return False
 
     async def wait_for_connect(self, call_id: str, timeout: int = 30) -> bool:
