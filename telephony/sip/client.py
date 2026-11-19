@@ -139,6 +139,7 @@ class SipPhoneClient:
         if state == "failed" and self._state in ("calling", "active"):
             logger.warning(f"sip W{self.worker_id}: media failed — marking call ended")
             self._state = "ended"
+            self._media_failed = True
             for ev in (self._answered_ev, self._end_ev):
                 if ev is not None:
                     ev.set()
@@ -173,6 +174,7 @@ class SipPhoneClient:
             self.sip_audio.bind_session(media)
             self._answered_ev = asyncio.Event()
             self._end_ev = asyncio.Event()
+            self._media_failed = False
             self._state = "calling"
             offer = await media.create_offer()
             await self._phone.start_call(phone, offer)
@@ -207,6 +209,8 @@ class SipPhoneClient:
         """Sync, called from an executor thread by the hangup monitor."""
         if self._state == "active":
             return "active"
+        if getattr(self, "_media_failed", False):
+            return "media_failed"
         return "ended"
 
     def check_ban_status(self):

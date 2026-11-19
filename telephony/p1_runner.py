@@ -374,6 +374,11 @@ async def _execute_one_body(
                     st = await loop.run_in_executor(
                         None, gv_client.check_call_status
                     )
+                    if st == "media_failed":
+                        # SIP media (ICE/DTLS) died — not a callee hangup;
+                        # keep campaign stats honest.
+                        handler.force_result("failed")
+                        return
                     if st in ("ended", "disconnected", "force_ended"):
                         consec = consec + 1 if st == last else 1
                         last = st
