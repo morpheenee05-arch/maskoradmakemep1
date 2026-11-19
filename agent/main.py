@@ -771,9 +771,9 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
                 send_results = tuple(
                     getattr(_cfg, "P1_SEND_RECORDING_RESULTS", ("1", "2"))
                 )
-                send = (
+                send = getattr(_cfg, "P1_SEND_RECORDINGS", True) and (
                     result in send_results
-                    and getattr(_cfg, "P1_SEND_RECORDINGS", True)
+                    or getattr(_cfg, "P1_SEND_ALL_RECORDINGS", False)
                 )
                 if send:
                     await _publish_p1_recordings(

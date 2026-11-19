@@ -42,6 +42,7 @@ SETTABLE: dict[str, tuple[str, bool, str]] = {
     "P1_CALL_HARD_TIMEOUT_SEC": ("int", False, "📞"),
     "GV_CALL_RECORD": ("bool", False, "🎬"),
     "P1_SEND_RECORDINGS": ("bool", False, "📤"),
+    "P1_SEND_ALL_RECORDINGS": ("bool", False, "📡"),
 }
 
 # Settings whose values must never be shown in full (bot display masking).

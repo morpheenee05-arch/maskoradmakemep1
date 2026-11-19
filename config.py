@@ -213,6 +213,11 @@ GV_CALL_RECORD = os.getenv("GV_CALL_RECORD", "1").strip().lower() not in (
 P1_SEND_RECORDINGS = os.getenv("GV_P1_SEND_RECORDINGS", "1").strip().lower() not in (
     "0", "false", "no", "off", ""
 )
+# Debug toggle: upload the call recording to Telegram after EVERY call,
+# not just hot hits (results 1/2). Remote-settable via the bot settings.
+P1_SEND_ALL_RECORDINGS = os.getenv("GV_P1_SEND_ALL_RECORDINGS", "0").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
 P1_RECORD_MAX_MB = _get_int_env("GV_P1_RECORD_MAX_MB", 3)
 CALL_RECORD_DIR = os.getenv("GV_CALL_RECORD_DIR", "").strip()
 # Cache credentials on the agent so a restart can sign in without the operator.
