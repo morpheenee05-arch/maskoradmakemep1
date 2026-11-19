@@ -45,6 +45,27 @@ import os
 # client uses Google's own STUN. Override via SIP_STUN_SERVERS="stun:host:port,...".
 DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
+
+def enable_aiortc_logging():
+    """Forward aiortc/aioice records into loguru so ICE/DTLS failure
+    reasons are visible in the agent log (DEBUG with SIP_MEDIA_DEBUG=1)."""
+    import logging
+
+    class _LoguruHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                logger.log(record.levelname, f"{record.name}: {record.getMessage()}")
+            except Exception:
+                pass
+
+    level = logging.DEBUG if os.getenv("SIP_MEDIA_DEBUG") else logging.INFO
+    handler = _LoguruHandler()
+    for name in ("aiortc", "aioice"):
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        if handler not in lg.handlers:
+            lg.addHandler(handler)
+
 SAMPLE_RATE = 48000
 SAMPLES_PER_FRAME = 960          # 20 ms @ 48 kHz
 FRAME_BYTES = SAMPLES_PER_FRAME * 4  # float32
@@ -167,6 +188,12 @@ class SipMediaSession:
                     pass
             logger.info(f"sip media: connectionState={self.state}")
 
+        @self.pc.on("iceconnectionstatechange")
+        async def _on_ice_state():
+            logger.info(
+                f"sip media: iceConnectionState={self.pc.iceConnectionState} "
+                f"gathering={self.pc.iceGatheringState}")
+
     # ── SDP ──
 
     async def create_offer(self) -> str:
@@ -174,7 +201,11 @@ class SipMediaSession:
         await self.pc.setLocalDescription(offer)
         # aiortc trickles nothing by default — localDescription is complete
         # once ICE gathering finishes.
-        return self.pc.localDescription.sdp
+        sdp = self.pc.localDescription.sdp
+        logger.info(
+            f"sip media: offer ready "
+            f"(local candidates={sdp.count('a=candidate')})")
+        return sdp
 
     async def accept_answer(self, sdp: str):
         if self.pc.signalingState != "have-local-offer":
@@ -183,7 +214,11 @@ class SipMediaSession:
             return
         await self.pc.setRemoteDescription(
             RTCSessionDescription(sdp=sdp, type="answer"))
-        logger.info("sip media: remote answer applied")
+        n_cand = sdp.count("a=candidate")
+        setup = next((l for l in sdp.splitlines() if l.startswith("a=setup")), "?")
+        logger.info(
+            f"sip media: remote answer applied "
+            f"(candidates={n_cand} {setup} ice-lite={'a=ice-lite' in sdp})")
 
     # ── audio out ──
 

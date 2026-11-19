@@ -925,7 +925,8 @@ def _sip_selfcheck():
     """
     try:
         from telephony.sip.pool import SipPool  # noqa: F401
-        from telephony.sip.media import _HAS_AIORTC
+        from telephony.sip.media import _HAS_AIORTC, enable_aiortc_logging
+        enable_aiortc_logging()
         if _HAS_AIORTC:
             logger.info("SIP backend: READY (aiortc OK)")
         else:
