@@ -75,3 +75,6 @@ storage/.update_applied
 # SIP reverse-engineering captures (contain live cookies/credentials)
 captures/
 tests-requests/
+
+# Downloaded JS dumps (reCAPTCHA probes etc.) — scraped artifacts, not source
+tools/scripts/
