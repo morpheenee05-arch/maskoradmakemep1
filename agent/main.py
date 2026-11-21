@@ -680,6 +680,10 @@ async def _publish_p1_recordings(bus, job_id, run_id, aid, phone, result, record
             "audio_b64": b64,
             "filename": Path(path).name, "caption": caption,
         })
+        logger.info(
+            f"[job {job_id}] p1 recording published to bus: "
+            f"{Path(path).name} ({len(b64) // 1024} KB b64)"
+        )
     finally:
         CallRecorder.delete_paths(recordings)
 
@@ -771,9 +775,14 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
                 send_results = tuple(
                     getattr(_cfg, "P1_SEND_RECORDING_RESULTS", ("1", "2"))
                 )
+                send_all = bool(getattr(_cfg, "P1_SEND_ALL_RECORDINGS", False))
                 send = getattr(_cfg, "P1_SEND_RECORDINGS", True) and (
                     result in send_results
-                    or getattr(_cfg, "P1_SEND_ALL_RECORDINGS", False)
+                    or send_all
+                )
+                logger.info(
+                    f"[job {job_id}] p1 recording: phone={phone} result={result} "
+                    f"send={send} (send_all={send_all})"
                 )
                 if send:
                     await _publish_p1_recordings(
@@ -781,6 +790,11 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
                     )
                 else:
                     CallRecorder.delete_paths(rec)
+            else:
+                logger.info(
+                    f"[job {job_id}] p1 recording: phone={phone} result={result} "
+                    f"— NO recording produced"
+                )
         except Exception as e:
             logger.warning(f"[job {job_id}] p1 recording handling failed: {e}")
 
