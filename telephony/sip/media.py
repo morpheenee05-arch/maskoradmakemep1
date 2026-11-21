@@ -406,9 +406,29 @@ class SipMediaSession:
             RTCSessionDescription(sdp=sdp, type="answer"))
         n_cand = sdp.count("a=candidate")
         setup = next((l for l in sdp.splitlines() if l.startswith("a=setup")), "?")
+        codecs = self._sdp_codecs(sdp)
         logger.info(
             f"sip media: remote answer applied "
-            f"(candidates={n_cand} {setup} ice-lite={'a=ice-lite' in sdp})")
+            f"(candidates={n_cand} {setup} ice-lite={'a=ice-lite' in sdp}) "
+            f"codecs={codecs}")
+
+    @staticmethod
+    def _sdp_codecs(sdp: str) -> str:
+        """'m=audio ... 0 8 96' + rtpmap → '0=PCMU/8000, 96=opus/48000'."""
+        payloads: list[str] = []
+        rtpmap: dict[str, str] = {}
+        for line in sdp.splitlines():
+            if line.startswith("m=audio"):
+                parts = line.split()
+                payloads = parts[3:]
+            elif line.startswith("a=rtpmap:"):
+                try:
+                    pt, desc = line[len("a=rtpmap:"):].split(None, 1)
+                    if pt in payloads:
+                        rtpmap[pt] = desc
+                except ValueError:
+                    pass
+        return ", ".join(f"{pt}={rtpmap.get(pt, '?')}" for pt in payloads)
 
     # ── audio out ──
 
@@ -423,14 +443,29 @@ class SipMediaSession:
 
     async def _reader(self, track):
         frames = 0
+        samples_total = 0
+        rate_seen = None
+        started = None
         try:
             while not self._closed:
                 frame = await track.recv()
                 frames += 1
+                if started is None:
+                    started = time.time()
+                samples_total += int(getattr(frame, "samples", 0) or 0)
+                rate_seen = frame.sample_rate or rate_seen
                 if frames == 1:
                     logger.info(
                         "sip media: remote audio flowing "
                         "(first inbound frame — far end is being heard)")
+                if started is not None and frames % 250 == 0:
+                    elapsed = time.time() - started
+                    if elapsed > 0.5:
+                        logger.info(
+                            f"sip media inbound rate: {samples_total / elapsed:.0f} "
+                            f"samples/s over {elapsed:.1f}s "
+                            f"(frames={frames}, {samples_total / frames:.0f} "
+                            f"samples/frame, frame_rate={rate_seen})")
                 try:
                     arr = frame.to_ndarray()          # (ch, n) — s16 or fltp
                 except Exception:
