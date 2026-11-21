@@ -1840,6 +1840,8 @@ def register_call_handlers(application):
     application.add_handler(CommandHandler("hangup", hangup_command))
     application.add_handler(CommandHandler("p1", p1_command))
     application.add_handler(CommandHandler("p1stop", p1stop_command))
+    from bot.commands.p1_distributed import flushall_command
+    application.add_handler(CommandHandler("flushall", flushall_command))
     application.add_handler(CallbackQueryHandler(operator_button_handler, pattern=r"^op_"))
     application.add_handler(CallbackQueryHandler(p1file_confirm_handler, pattern=r"^p1file_"))
     from bot.commands.p1_distributed import p1_backend_pick_handler

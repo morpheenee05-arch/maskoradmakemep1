@@ -157,6 +157,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  `/p1 <phone> [phone2] [phone3]` — Scripted IVR (bulk supported)\n"
         "  `/p1live` — Live bulk session stats (inline dashboard)\n"
         "  `/p1stop` — Stop bulk queue\n"
+        "  `/flushall` — Wipe Redis (stuck sessions, queues, settings)\n"
         "  📄 Send a `.txt` file to extract numbers\n"
         "  `/hangup [call_id]` — End an active call\n"
         "  `/settings` or `/script` — Script templates (create / pick default)\n"

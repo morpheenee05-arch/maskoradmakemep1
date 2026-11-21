@@ -617,3 +617,43 @@ async def p1stop_distributed(update, context, bus):
         f"Workers will finish active calls and halt.",
         parse_mode="HTML",
     )
+
+
+async def flushall_command(update, context):
+    """/flushall — nuclear Redis reset on the controller.
+
+    Wipes EVERYTHING in the Redis DB: stuck p1 sessions/queues, the agent
+    registry (agents re-register on their next heartbeat) and the remote
+    settings hash (Deepgram keys, P1_SEND_ALL_RECORDINGS — must be re-set).
+    Also drops the controller's local p1 state, so a 'session already
+    active' ghost can never survive this command.
+    """
+    msg = update.effective_message
+    bus = context.bot_data.get("bus")
+    if bus is None:
+        await msg.reply_text("⚠️ Standalone mode — no Redis to flush.")
+        return
+
+    st = context.bot_data.pop("p1_dist", None)
+    if st is not None:
+        st["running"] = False
+        task = st.get("task")
+        if task and not task.done():
+            task.cancel()
+
+    try:
+        r = await bus.connect()
+        await r.flushall()
+    except Exception as e:
+        await msg.reply_text(f"❌ FLUSHALL failed: {e}")
+        return
+
+    logger.warning("/flushall executed — Redis DB wiped (settings hash included)")
+    await msg.reply_text(
+        "🧨 <b>Redis FLUSHALL done.</b>\n\n"
+        "Wiped: stuck p1 sessions, work queues, agent registry, remote settings.\n"
+        "• Agents come back online on their heartbeat (~30s).\n"
+        "• ⚙️ Settings (Deepgram keys, 📡 P1_SEND_ALL_RECORDINGS) were wiped too "
+        "— re-apply them in the bot.",
+        parse_mode="HTML",
+    )
