@@ -88,8 +88,28 @@ async def sip_agent_payload(context, aid: str) -> tuple:
             "📞 Test call — type a number",
             callback_data=f"camp:sip:num:{aid}",
         )],
+        [InlineKeyboardButton(
+            "📞📞 Dual call — 2 numbers at once (1 account)",
+            callback_data=f"camp:sip:dual:{aid}",
+        )],
         _back("camp:sip"),
     ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def sip_dual_prompt_payload(aid: str) -> tuple:
+    lines = [
+        f"📞📞 <b>Dual call from {_esc(aid)}</b>",
+        "",
+        "Send <b>two</b> phone numbers (space/comma/newline separated, "
+        "E.164: <code>+1403… +1718…</code>).",
+        "",
+        "Experiment: two simultaneous calls from ONE GV account — two SIP "
+        "registrations on the same credentials, full media on both legs. "
+        "A test tone plays into each call (440 Hz on A, 554 Hz on B) and "
+        "the remote audio of each leg comes back as a WAV + verdict.",
+    ]
+    rows = [[InlineKeyboardButton("❌ Cancel", callback_data="camp:sip:cancel")]]
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
@@ -107,7 +127,8 @@ def sip_number_prompt_payload(aid: str) -> tuple:
 
 # ── rendering ────────────────────────────────────────────────────────────────
 
-_STAGE_ORDER = ("worker", "cookies", "mint", "register", "pcc", "call")
+_STAGE_ORDER = ("worker", "cookies", "mint", "register", "pcc", "call",
+                "callA", "callB")
 _STAGE_TITLE = {
     "worker": "Worker",
     "cookies": "Cookies",
@@ -115,6 +136,8 @@ _STAGE_TITLE = {
     "register": "REGISTER",
     "pcc": "Caller-ID context",
     "call": "Test call",
+    "callA": "Call A",
+    "callB": "Call B",
 }
 
 
@@ -136,19 +159,33 @@ def _stage_line(name: str, data) -> str:
                 f"(password len {data.get('password_len')})")
     if name == "register":
         if not data.get("ok"):
+            regs = data.get("registrations")
+            if regs is not None:
+                return (f"⚠️ REGISTER: only {_esc(', '.join(regs) or 'none')} "
+                        "of A/B live")
             return f"❌ REGISTER: {_esc(data.get('error', 'failed'))}"
+        if data.get("registrations") is not None:
+            return ("✅ REGISTER ×2: legs "
+                    f"{_esc(', '.join(data['registrations']))} live "
+                    "on ONE credential set")
         return f"✅ REGISTER 200 OK (expires {data.get('expires', '?')}s)"
     if name == "pcc":
         if not data.get("ok"):
             detail = data.get("error") or data.get("log") or "failed"
             return f"⚠️ Caller-ID context: {_esc(detail[:120])}"
         return f"✅ Caller-ID context: {data.get('len', '?')} chars"
-    if name == "call":
+    if name == "call" or name.startswith("call") and len(name) == 5:
         verdict = data.get("verdict", "?")
-        icon = {"answered": "✅", "failed": "❌", "bye": "📴"}.get(verdict, "⚠️")
+        icon = "✅" if verdict == "answered" else (
+            "📴" if verdict == "bye" else "❌" if "fail" in str(verdict) else "⚠️")
         flow = " → ".join(data.get("flow") or []) or "—"
-        return (f"{icon} Test call <code>{_esc(data.get('number'))}</code>: "
-                f"{verdict}\n   └ {_esc(flow)}")
+        extra = ""
+        if data.get("audio_sec"):
+            extra = (f" · audio {data['audio_sec']}s "
+                     f"rms={data.get('max_rms', '?')}")
+        label = "Test call" if name == "call" else f"Call {name[-1]}"
+        return (f"{icon} {label} <code>{_esc(data.get('number'))}</code>: "
+                f"{_esc(verdict)}{extra}\n   └ {_esc(flow)}")
     return f"• {title}: {_esc(data)}"
 
 
@@ -210,15 +247,19 @@ def _build_log_file(aid: str, jid: str, call: str, stages: dict,
 
 # ── run & collect ────────────────────────────────────────────────────────────
 
-async def run_sip_test(message, context, aid: str, call: str = ""):
+async def run_sip_test(message, context, aid: str, call: str = "",
+                       calls: list = None):
     """Dispatch the sip_test job and live-render progress into `message`."""
     bus = context.bot_data.get("bus")
     if bus is None:
         await message.reply_text("⚠️ Redis bus is not available.")
         return
 
-    params = {"hold": 20}
-    if call:
+    dual = bool(calls and len(calls) >= 2)
+    params = {"hold": 25 if dual else 20}
+    if dual:
+        params["calls"] = calls[:2]
+    elif call:
         params["call"] = call
     try:
         jid = await bus.dispatch_job(aid, {"type": "sip_test", "params": params})
@@ -226,7 +267,8 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
         await message.reply_text(f"❌ Dispatch failed: {_esc(e)}", parse_mode="HTML")
         return
 
-    timeout = int(os.getenv("SIP_TEST_TIMEOUT_SEC", "90" if call else "60"))
+    default_timeout = "120" if dual else ("90" if call else "60")
+    timeout = int(os.getenv("SIP_TEST_TIMEOUT_SEC", default_timeout))
     started = time.time()
     status = await message.reply_text(
         _render_live(aid, {}, [f"job dispatched → {aid}"]),
@@ -250,6 +292,8 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
                     kind = msg.get("kind")
                     if kind == "sip_progress":
                         log_lines.append(msg.get("line", ""))
+                    elif kind == "sip_audio":
+                        await _send_leg_audio(message, msg, log_lines)
                     elif kind == "sip_done":
                         done = msg
                 except Exception as e:
@@ -308,6 +352,31 @@ async def run_sip_test(message, context, aid: str, call: str = ""):
     await _send_log(status, aid, jid, call, stages, log_lines, done, "")
 
 
+async def _send_leg_audio(message, msg: dict, log_lines: list):
+    """Ship one dual-call leg recording to the chat as it arrives."""
+    import base64 as _b64
+    leg = msg.get("leg", "?")
+    phone = msg.get("phone", "")
+    verdict = msg.get("verdict", "?")
+    log_lines.append(f"[{leg}] recording received "
+                     f"({len(msg.get('audio_b64') or '') // 1024} KB b64)")
+    try:
+        raw = _b64.b64decode(msg.get("audio_b64") or "")
+    except Exception as e:
+        logger.warning(f"sip_audio decode failed: {e}")
+        return
+    try:
+        from telegram import InputFile
+        await message.reply_audio(
+            audio=InputFile(raw, filename=msg.get("filename") or f"leg_{leg}.wav"),
+            caption=(f"🎧 Dual call — leg {leg} · <code>{_esc(phone)}</code>\n"
+                     f"verdict: {_esc(verdict)} · remote audio (callee side)"),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"sip_audio telegram send failed: {e}")
+
+
 async def _send_log(status, aid: str, jid: str, call: str, stages: dict,
                     log_lines: list, done, error: str):
     """Ship the full run log as a .log document — chat stays compact."""
@@ -339,6 +408,10 @@ async def handle_sip_callback(update, context, query, parts: list):
         context.bot_data["sip_pending"] = {"agent": parts[3]}
         text, markup = sip_number_prompt_payload(parts[3])
         await _edit(query, text, markup)
+    elif sub == "dual" and len(parts) > 3:
+        context.bot_data["sip_pending"] = {"agent": parts[3], "mode": "dual"}
+        text, markup = sip_dual_prompt_payload(parts[3])
+        await _edit(query, text, markup)
     elif sub == "cancel":
         context.bot_data.pop("sip_pending", None)
         text, markup = await sip_home_payload(context)
@@ -369,6 +442,36 @@ async def sip_text_input(update, context):
     context.bot_data.pop("sip_pending", None)
 
     import re as _re
+
+    def _numbers(raw: str) -> list:
+        out = []
+        for chunk in _re.split(r"[\s,;]+", raw):
+            n = _re.sub(r"[^\d+]", "", chunk)
+            if n and not n.startswith("+"):
+                n = "+" + n
+            if len(n) >= 8:
+                out.append(n)
+        return out
+
+    if pending.get("mode") == "dual":
+        nums = _numbers(text)[:2]
+        if len(nums) < 2:
+            await update.message.reply_text(
+                "⚠️ Need <b>two</b> numbers (e.g. "
+                "<code>+14036139786 +17185551234</code>) — cancelled.",
+                parse_mode="HTML",
+            )
+            raise ApplicationHandlerStop
+        await update.message.reply_text(
+            f"📞📞 Dual call: A=<code>{_esc(nums[0])}</code> "
+            f"B=<code>{_esc(nums[1])}</code> via "
+            f"<b>{_esc(pending['agent'])}</b> — live log below 👇",
+            parse_mode="HTML",
+        )
+        await run_sip_test(update.message, context, pending["agent"],
+                           calls=nums)
+        raise ApplicationHandlerStop
+
     number = _re.sub(r"[^\d+]", "", text)
     if not number.startswith("+"):
         number = "+" + number if number else ""

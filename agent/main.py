@@ -170,6 +170,10 @@ async def _handle_sip_test_job(pool, bus, job: dict):
     job_id = job.get("job_id")
     aid = config.AGENT_ID
     params = job.get("params") or {}
+    calls = [str(n).strip() for n in (params.get("calls") or []) if str(n).strip()]
+    if len(calls) >= 2:
+        await _handle_sip_dual_test_job(pool, bus, job, calls[:2])
+        return
     call_number = str(params.get("call") or "").strip()
     hold = max(5, min(120, int(params.get("hold") or 25)))
     want_worker = params.get("worker")
@@ -395,6 +399,313 @@ async def _handle_sip_test_job(pool, bus, job: dict):
             "stages": stages, "events": events[-40:], "error": error,
         })
         logger.info(f"[job {job_id}] sip_test done (error={error})")
+
+
+async def _handle_sip_dual_test_job(pool, bus, job: dict, calls: list):
+    """Concurrency experiment: TWO simultaneous outbound calls from ONE GV
+    account, on two separate SIP registrations (two WebSocket connections
+    sharing the same minted credentials), each with its own media session.
+
+    We want to see what Google actually does: does the second REGISTER kill
+    the first, is the second INVITE rejected (486/480), do both calls get
+    media, does one drop when the other is answered. Each call's remote
+    audio is recorded and shipped back as a WAV; a low test tone (a
+    different pitch per call) is played into each leg for identification.
+    """
+    job_id = job.get("job_id")
+    aid = config.AGENT_ID
+    params = job.get("params") or {}
+    hold = max(8, min(45, int(params.get("hold") or 25)))
+
+    async def progress(stage: str, line: str):
+        try:
+            await bus.publish_result({
+                "job_id": job_id, "agent_id": aid, "kind": "sip_progress",
+                "stage": stage, "line": line,
+            })
+        except Exception:
+            pass
+
+    stages: dict = {}
+    events: list = []
+    error = None
+    phones: list = []
+    sessions: list = []
+
+    import numpy as np
+    from pathlib import Path
+
+    def _write_wav(path, pcm24: bytes):
+        import wave
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)
+            wf.writeframes(pcm24)
+
+    try:
+        # ── 1. worker with a live signed-in Chrome ──
+        worker = None
+        for w in pool.workers:
+            if w.driver is not None and w.is_authenticated:
+                worker = w
+                break
+        if worker is None or worker.driver is None:
+            raise RuntimeError(
+                "no signed-in worker with a live Chrome on this agent")
+        stages["worker"] = {
+            "worker_id": worker.worker_id,
+            "email": worker.account_email or worker.credential_email or "",
+            "number": worker.phone_number or "",
+        }
+        await progress("cookies", f"using W{worker.worker_id} "
+                                  f"({stages['worker']['email'] or '?'})")
+
+        # ── 2. cookies via CDP (sees HttpOnly too) ──
+        def _harvest():
+            drv = worker.driver
+            if "voice.google.com" not in (drv.current_url or ""):
+                drv.get("https://voice.google.com/u/0/calls")
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                cookies = {}
+                try:
+                    res = drv.execute_cdp_cmd("Storage.getCookies", {})
+                    for c in res.get("cookies", []):
+                        if "google.com" in (c.get("domain") or ""):
+                            cookies[c["name"]] = {
+                                "value": c.get("value", ""),
+                                "domain": c.get("domain", ""),
+                            }
+                except Exception:
+                    cookies = {}
+                if not cookies:
+                    raw = drv.execute_script("return document.cookie") or ""
+                    cookies = {
+                        p.strip().split("=", 1)[0]: p.strip().split("=", 1)[1]
+                        for p in raw.split(";") if "=" in p
+                    }
+                if any(k in cookies for k in (
+                        "SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")):
+                    return cookies
+                time.sleep(2)
+            raise RuntimeError("no SAPISID-family cookies — re-login worker")
+
+        cookies = await asyncio.to_thread(_harvest)
+        stages["cookies"] = {"found": [k for k in (
+            "SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID") if k in cookies]}
+        await progress("cookies", "cookies ok")
+
+        # ── 3. mint one set of SIP credentials (shared by both legs) ──
+        from telephony.sip.gv_auth import VoiceAPIClient
+        api = VoiceAPIClient(cookies)
+        creds = await asyncio.to_thread(api.get_sip_register_info)
+        stages["mint"] = {
+            "ok": True, "source": "direct API",
+            "username": creds.username, "password_len": len(creds.password),
+        }
+        await progress("mint", f"SIP creds: {creds.username} — ONE set "
+                               f"shared by both registrations")
+
+        # ── 4. two registrations on two WebSocket connections ──
+        from telephony.sip.sip_ws import GVWebPhone
+        from telephony.sip.media import SipMediaSession
+        from audio.engine import resample as _resample
+
+        legs = [
+            {"tag": "A", "number": calls[0], "events": [], "flow": [],
+             "finished": asyncio.Event(), "rec": bytearray(),
+             "chunks": 0, "max_rms": 0.0},
+            {"tag": "B", "number": calls[1], "events": [], "flow": [],
+             "finished": asyncio.Event(), "rec": bytearray(),
+             "chunks": 0, "max_rms": 0.0},
+        ]
+
+        def make_on_event(leg):
+            def on_event(kind: str, info: dict):
+                slim = {k: str(v)[:120] for k, v in info.items() if k != "sdp"}
+                leg["events"].append({"kind": kind, **slim})
+                if kind in ("calling", "ringing", "early_media",
+                            "answered", "failed", "bye"):
+                    leg["flow"].append(kind)
+                asyncio.ensure_future(
+                    progress("sip", f"[{leg['tag']}] event {kind} {slim}"))
+                if kind in ("answered", "early_media"):
+                    sdp = info.get("sdp")
+                    sess = leg.get("session")
+                    if sdp and sess is not None:
+                        asyncio.ensure_future(sess.accept_answer(sdp))
+                if kind in ("bye", "failed", "transport_lost"):
+                    leg["finished"].set()
+            return on_event
+
+        reg_ok = []
+        for leg in legs:
+            phone = GVWebPhone(creds, on_event=make_on_event(leg))
+            leg["phone"] = phone
+            phones.append(phone)
+            try:
+                await asyncio.wait_for(phone.connect(), timeout=20)
+                await asyncio.wait_for(phone.register(), timeout=30)
+                reg_ok.append(leg["tag"])
+                await progress("register",
+                               f"REGISTER {leg['tag']}: 200 OK "
+                               f"(same creds as {'A' if leg['tag'] == 'B' else '—'})")
+            except Exception as e:
+                await progress("register",
+                               f"REGISTER {leg['tag']}: FAILED — {e}")
+        stages["register"] = {
+            "ok": len(reg_ok) == 2,
+            "registrations": reg_ok,
+            "note": ("both registrations live on one credential set"
+                     if len(reg_ok) == 2 else
+                     "only: " + ",".join(reg_ok) if reg_ok else "none"),
+        }
+        if not reg_ok:
+            raise RuntimeError("no SIP registration succeeded at all")
+
+        # ── 5. media sessions + test tones ──
+        for i, leg in enumerate(legs):
+            if leg["tag"] not in reg_ok:
+                continue
+
+            def make_on_audio(leg_):
+                def on_audio(pcm48: bytes):
+                    arr = np.frombuffer(pcm48, dtype=np.float32)
+                    dg = _resample(arr, 48000, 24000)
+                    rms = float(np.sqrt(np.mean(dg * dg))) if dg.size else 0.0
+                    leg_["chunks"] += 1
+                    if rms > leg_["max_rms"]:
+                        leg_["max_rms"] = rms
+                    leg_["rec"].extend(
+                        (np.clip(dg, -1.0, 1.0) * 32767.0)
+                        .astype(np.int16).tobytes())
+                return on_audio
+
+            session = SipMediaSession(on_audio=make_on_audio(leg))
+            leg["session"] = session
+            sessions.append(session)
+            # Distinct low test tone per leg: A=440 Hz, B=554 Hz.
+            freq = 440.0 if leg["tag"] == "A" else 554.0
+            t = np.arange(int(hold * 48000), dtype=np.float32) / 48000.0
+            tone = (0.12 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+            leg["tone"] = tone.tobytes()
+
+        # ── 6. fire both INVITEs back-to-back ──
+        for leg in legs:
+            if leg["tag"] not in reg_ok:
+                continue
+            offer = await leg["session"].create_offer()
+            leg["tone_pushed"] = False
+            try:
+                await leg["phone"].start_call(leg["number"], offer)
+                await progress("call", f"[{leg['tag']}] INVITE → {leg['number']}")
+            except Exception as e:
+                leg["flow"].append("failed")
+                leg["finished"].set()
+                await progress("call", f"[{leg['tag']}] INVITE failed: {e}")
+            # Push the tone right away — the queue drains in real time once
+            # media connects.
+            leg["session"].push_pcm(leg["tone"])
+            leg["tone_pushed"] = True
+
+        # ── 7. wait: both finished or hold expires ──
+        async def _both_done():
+            await asyncio.gather(
+                *(leg["finished"].wait()
+                  for leg in legs if leg["tag"] in reg_ok))
+        try:
+            await asyncio.wait_for(_both_done(), timeout=hold)
+        except asyncio.TimeoutError:
+            pass
+
+        # ── 8. verdicts + hangup ──
+        for leg in legs:
+            if leg["tag"] not in reg_ok:
+                stages[f"call{leg['tag']}"] = {
+                    "number": leg["number"], "verdict": "no-registration",
+                    "flow": [],
+                }
+                continue
+            try:
+                await leg["phone"].hangup()
+            except Exception:
+                pass
+            verdict = next(
+                (k for k in reversed(leg["flow"])
+                 if k in ("answered", "failed", "bye")),
+                "no-answer",
+            )
+            fail = next(
+                (e for e in reversed(leg["events"]) if e["kind"] == "failed"),
+                None,
+            )
+            if verdict == "failed" and fail:
+                verdict = "failed " + str(
+                    {k: v for k, v in fail.items() if k != "kind"})[:100]
+            dur = leg["chunks"] * 0.02  # ~20 ms per inbound frame
+            stages[f"call{leg['tag']}"] = {
+                "number": leg["number"],
+                "verdict": verdict,
+                "flow": leg["flow"],
+                "audio_sec": round(dur, 1),
+                "max_rms": round(leg["max_rms"], 4),
+            }
+            events.extend({"leg": leg["tag"], **e} for e in leg["events"])
+            await progress(
+                "call",
+                f"[{leg['tag']}] verdict={verdict} audio={dur:.1f}s "
+                f"rms={leg['max_rms']:.3f} flow={'→'.join(leg['flow'])}")
+
+        await asyncio.sleep(1.0)
+
+        # ── 9. ship recordings ──
+        import tempfile
+        from audio.call_recorder import read_recording_b64
+        for leg in legs:
+            if not leg["rec"]:
+                continue
+            path = (Path(tempfile.gettempdir()) /
+                    f"sip_dual_{leg['tag']}_w{worker.worker_id}_"
+                    f"{int(time.time())}.wav")
+            try:
+                await asyncio.to_thread(_write_wav, path, bytes(leg["rec"]))
+                b64 = read_recording_b64(path)
+                if b64:
+                    await bus.publish_result({
+                        "job_id": job_id, "agent_id": aid,
+                        "kind": "sip_audio",
+                        "leg": leg["tag"], "phone": leg["number"],
+                        "verdict": stages.get(f"call{leg['tag']}", {}).get("verdict", "?"),
+                        "audio_b64": b64, "filename": path.name,
+                    })
+            except Exception as e:
+                logger.warning(f"[job {job_id}] dual wav failed: {e}")
+            finally:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        error = str(e)
+        logger.exception(f"[job {job_id}] sip dual test failed")
+    finally:
+        for leg_sess in sessions:
+            try:
+                await leg_sess.close()
+            except Exception:
+                pass
+        for p in phones:
+            try:
+                await p.close()
+            except Exception:
+                pass
+        await bus.publish_result({
+            "job_id": job_id, "agent_id": aid, "kind": "sip_done",
+            "stages": stages, "events": events[-60:], "error": error,
+        })
+        logger.info(f"[job {job_id}] sip dual test done (error={error})")
 
 
 async def _handle_login_job(pool, bus, job: dict):
