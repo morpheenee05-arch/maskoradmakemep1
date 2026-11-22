@@ -1065,9 +1065,10 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
             "job_id": job_id, "run_id": run_id, "agent_id": aid,
             "kind": "p1_progress", "phone": phone, "result": result,
         }
-        # Attach per-call diagnostics (stage/why/elapsed/stop flag) so the
-        # controller log shows exactly WHY a call ended cancelled/failed.
-        if result in ("cancelled", "failed", "timeout"):
+        # Attach per-call diagnostics (stage/why/elapsed/stop flag, plus the
+        # SIP signaling trace for no-answers) so the controller log shows
+        # exactly WHY a call ended the way it did.
+        if result in ("cancelled", "failed", "timeout", "not_answered"):
             try:
                 from telephony.p1_runner import get_last_diag
                 d = get_last_diag()

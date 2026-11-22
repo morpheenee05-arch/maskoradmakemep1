@@ -336,7 +336,21 @@ async def _execute_one_body(
         if not connected:
             await _safe_hangup(gv_client, call_id)
             prepare_task.cancel()
-            _diag_set(why="not_answered", elapsed_s=round(time.monotonic() - t0, 1))
+            # SIP backend knows WHY the call never reached 200 OK (ring count,
+            # early media, final failure code) — surface it in the diag so the
+            # controller can tell "rang out" apart from "rejected by network".
+            extra: dict = {}
+            try:
+                sd = getattr(gv_client, "sip_call_diag", None)
+                if callable(sd):
+                    extra = sd() or {}
+            except Exception:
+                extra = {}
+            _diag_set(
+                why="not_answered",
+                elapsed_s=round(time.monotonic() - t0, 1),
+                **extra,
+            )
             await _ensure_ready(gv_client, "p1 no-answer")
             # The handler never went live — it stays healthy for the next call.
             keep_warm = True

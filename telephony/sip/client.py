@@ -62,6 +62,13 @@ class SipPhoneClient:
         self._end_ev: Optional[asyncio.Event] = None
         self._media: Optional[SipMediaSession] = None
 
+        # Per-call signaling trace — explains WHY a call never reached 200 OK
+        # (rings seen, early media present, final SIP failure code).
+        self._sip_ring_count = 0
+        self._sip_early_media = False
+        self._sip_fail_code = None
+        self._sip_fail_reason = None
+
     # ── registration ──
 
     def _mint_creds(self):
@@ -115,12 +122,23 @@ class SipPhoneClient:
             sdp = info.get("sdp")
             if sdp and self._media is not None:
                 asyncio.ensure_future(self._apply_answer(sdp))
+        elif kind == "ringing":
+            self._sip_ring_count += 1
         elif kind == "early_media":
+            self._sip_early_media = True
             sdp = info.get("sdp")
             if sdp and self._media is not None:
                 asyncio.ensure_future(self._apply_answer(sdp))
         elif kind in ("failed", "bye"):
+            was_active = self._state == "active"
             self._state = "ended"
+            if kind == "failed":
+                self._sip_fail_code = info.get("code")
+                self._sip_fail_reason = info.get("reason")
+            elif not was_active and self._sip_fail_code is None:
+                # Pre-answer BYE — the far end gave up while we were ringing.
+                self._sip_fail_code = "bye"
+                self._sip_fail_reason = info.get("reason") or "remote ended during setup"
             for ev in (self._answered_ev, self._end_ev):
                 if ev is not None:
                     ev.set()
@@ -175,6 +193,10 @@ class SipPhoneClient:
             self._answered_ev = asyncio.Event()
             self._end_ev = asyncio.Event()
             self._media_failed = False
+            self._sip_ring_count = 0
+            self._sip_early_media = False
+            self._sip_fail_code = None
+            self._sip_fail_reason = None
             self._state = "calling"
             offer = await media.create_offer()
             await self._phone.start_call(phone, offer)
@@ -212,6 +234,18 @@ class SipPhoneClient:
         if getattr(self, "_media_failed", False):
             return "media_failed"
         return "ended"
+
+    def sip_call_diag(self) -> dict:
+        """Signaling trace of the current/last call — why no 200 OK happened."""
+        d: dict = {}
+        if self._sip_ring_count:
+            d["sip_rings"] = self._sip_ring_count
+        if self._sip_early_media:
+            d["sip_early_media"] = True
+        if self._sip_fail_code is not None:
+            d["sip_fail_code"] = self._sip_fail_code
+            d["sip_fail_reason"] = self._sip_fail_reason or ""
+        return d
 
     def check_ban_status(self):
         return False, ""
