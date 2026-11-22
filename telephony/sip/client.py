@@ -35,8 +35,12 @@ REREGISTER_MARGIN = 300
 
 class SipPhoneClient:
     def __init__(self, worker_id: int, cookies_provider: Callable[[], dict],
-                 email: str = "", number: str = ""):
+                 email: str = "", number: str = "", stream_idx: int = 0):
         self.worker_id = worker_id
+        self.stream_idx = stream_idx
+        # Log tag: W4 for a single stream, W4s1/W4s2 when several streams
+        # share one account.
+        self._tag = f"W{worker_id}" if not stream_idx else f"W{worker_id}s{stream_idx}"
         self.account_email = email
         self.phone_number = number
         self._cookies_provider = cookies_provider  # () -> cookie dict (CDP)
@@ -101,10 +105,10 @@ class SipPhoneClient:
                     pass
             self._phone = phone
             self._cred_ts = time.time()
-            logger.info(f"sip W{self.worker_id}: registered")
+            logger.info(f"sip {self._tag}: registered")
 
     async def _drop_registration(self, why: str):
-        logger.warning(f"sip W{self.worker_id}: dropping registration ({why})")
+        logger.warning(f"sip {self._tag}: dropping registration ({why})")
         phone, self._phone = self._phone, None
         if phone is not None:
             try:
@@ -155,7 +159,7 @@ class SipPhoneClient:
         # script into dead air. ("closed" is NOT an error — it fires from our
         # own teardown in _teardown_media.)
         if state == "failed" and self._state in ("calling", "active"):
-            logger.warning(f"sip W{self.worker_id}: media failed — marking call ended")
+            logger.warning(f"sip {self._tag}: media failed — marking call ended")
             self._state = "ended"
             self._media_failed = True
             for ev in (self._answered_ev, self._end_ev):
@@ -169,7 +173,7 @@ class SipPhoneClient:
         try:
             await media.accept_answer(sdp)
         except Exception as e:
-            logger.warning(f"sip W{self.worker_id}: accept_answer failed: {e}")
+            logger.warning(f"sip {self._tag}: accept_answer failed: {e}")
 
     # ── p1 call interface ──
 
@@ -204,7 +208,7 @@ class SipPhoneClient:
             self._fail_streak = 0
             return True
         except Exception as e:
-            logger.warning(f"sip W{self.worker_id}: make_call failed: {e}")
+            logger.warning(f"sip {self._tag}: make_call failed: {e}")
             await self._teardown_media()
             # Back off on consecutive failures — a fast-failing client must
             # not burn the whole number queue in seconds.
@@ -212,7 +216,7 @@ class SipPhoneClient:
             if self._fail_streak >= 3:
                 backoff = min(2 * self._fail_streak, 15)
                 logger.warning(
-                    f"sip W{self.worker_id}: {self._fail_streak} consecutive "
+                    f"sip {self._tag}: {self._fail_streak} consecutive "
                     f"make_call failures — backing off {backoff}s")
                 await asyncio.sleep(backoff)
             return False
@@ -256,7 +260,7 @@ class SipPhoneClient:
             if phone is not None:
                 await phone.hangup()
         except Exception as e:
-            logger.debug(f"sip W{self.worker_id}: hangup: {e}")
+            logger.debug(f"sip {self._tag}: hangup: {e}")
         self._active_calls.pop(call_id, None)
         await self._teardown_media()
         self._state = "idle"
@@ -287,7 +291,7 @@ class SipPhoneClient:
             await self._ensure_registered()
             return True
         except Exception as e:
-            logger.warning(f"sip W{self.worker_id}: recover failed: {e}")
+            logger.warning(f"sip {self._tag}: recover failed: {e}")
             return False
 
     # ── lifecycle ──

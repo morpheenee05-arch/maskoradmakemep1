@@ -218,6 +218,11 @@ P1_SEND_RECORDINGS = os.getenv("GV_P1_SEND_RECORDINGS", "1").strip().lower() not
 P1_SEND_ALL_RECORDINGS = os.getenv("GV_P1_SEND_ALL_RECORDINGS", "0").strip().lower() not in (
     "0", "false", "no", "off", ""
 )
+# Parallel outbound calls per GV account on the SIP backend. Each stream is
+# a full independent line (own SIP registration, media, STT, recording) —
+# the dual-call test proved 2 work from one account. Clamped to 1–4 at the
+# SipPool. Remote-settable via the bot settings; applies to the next campaign.
+SIP_STREAMS_PER_ACCOUNT = _get_int_env("GV_SIP_STREAMS_PER_ACCOUNT", 1)
 P1_RECORD_MAX_MB = _get_int_env("GV_P1_RECORD_MAX_MB", 3)
 CALL_RECORD_DIR = os.getenv("GV_CALL_RECORD_DIR", "").strip()
 # Cache credentials on the agent so a restart can sign in without the operator.

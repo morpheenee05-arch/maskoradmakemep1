@@ -653,6 +653,14 @@ async def _setting_detail_payload(context, name: str) -> tuple:
             "or new lines — every key is verified online before saving"
         ),
     }
+    notes = {
+        "SIP_STREAMS_PER_ACCOUNT": (
+            "Parallel calls per GV account on the SIP backend (1–4). "
+            "2 is proven stable by the dual-call test; each stream is a full "
+            "line with its own registration, STT and recording. "
+            "Applies to the next campaign start — no restart needed."
+        ),
+    }
     lines = [
         f"{emoji} <b>{_esc(name)}</b>",
         "",
@@ -660,6 +668,8 @@ async def _setting_detail_payload(context, name: str) -> tuple:
         + (" (remote override)" if is_override else " (default/env)"),
         f"Type: {hints.get(typ, 'text')}",
     ]
+    if name in notes:
+        lines.append(notes[name])
     if restart:
         lines.append("🔄 Takes effect only after an agent restart.")
     elif typ == "keys":

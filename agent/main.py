@@ -1016,9 +1016,13 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
     if backend == "sip":
         try:
             from telephony.sip.pool import SipPool
-            pool = SipPool(pool)
+            streams = int(getattr(config, "SIP_STREAMS_PER_ACCOUNT", 1) or 1)
+            pool = SipPool(pool, streams_per_account=streams)
             backend_used = "sip"
-            logger.info(f"[job {job_id}] p1 backend=SIP")
+            logger.info(
+                f"[job {job_id}] p1 backend=SIP "
+                f"(streams/account={streams} → {len(pool.workers)} line(s))"
+            )
         except Exception as e:
             logger.warning(f"[job {job_id}] SIP pool unavailable ({e}) — falling back to manual Chrome backend")
             try:

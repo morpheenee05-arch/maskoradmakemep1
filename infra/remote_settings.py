@@ -40,6 +40,7 @@ SETTABLE: dict[str, tuple[str, bool, str]] = {
     "GV_WORKER_STUCK_SEC": ("int", False, "🛡"),
     # Calls
     "P1_CALL_HARD_TIMEOUT_SEC": ("int", False, "📞"),
+    "SIP_STREAMS_PER_ACCOUNT": ("int", False, "📶"),
     "GV_CALL_RECORD": ("bool", False, "🎬"),
     "P1_SEND_RECORDINGS": ("bool", False, "📤"),
     "P1_SEND_ALL_RECORDINGS": ("bool", False, "📡"),
