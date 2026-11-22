@@ -467,11 +467,22 @@ class SipMediaSession:
                             f"(frames={frames}, {samples_total / frames:.0f} "
                             f"samples/frame, frame_rate={rate_seen})")
                 try:
-                    arr = frame.to_ndarray()          # (ch, n) — s16 or fltp
+                    arr = frame.to_ndarray()          # (ch, n) planar or (1, C*n) packed
                 except Exception:
                     continue
                 if arr.size == 0:
                     continue
+                if frames == 1:
+                    logger.info(
+                        f"sip media inbound fmt: format={frame.format.name} "
+                        f"layout={frame.layout.name} shape={tuple(arr.shape)} "
+                        f"rate={frame.sample_rate}")
+                # Channel count from the frame layout — needed to unpack
+                # interleaved (packed) buffers, which arrive as (1, C*n).
+                try:
+                    n_ch = max(1, len(frame.layout.channels))
+                except Exception:
+                    n_ch = 1
                 # Normalize BEFORE downmix: mean() on int16 promotes to
                 # float64 while keeping the ±32768 scale, so the dtype check
                 # must happen first or the samples stay int16-scaled floats
@@ -480,7 +491,12 @@ class SipMediaSession:
                     arr = arr.astype(np.float32) / 32768.0
                 else:
                     arr = arr.astype(np.float32)
-                if arr.ndim == 2:
+                if arr.ndim == 2 and arr.shape[0] == 1 and n_ch > 1:
+                    # Packed/interleaved samples (LRLR…) laid out as a single
+                    # plane. Reading them as mono doubles the duration and
+                    # halves the pitch — reshape to (n, C) and downmix for real.
+                    arr = arr.reshape(-1, n_ch).mean(axis=1, dtype=np.float32)
+                elif arr.ndim == 2:
                     arr = arr.mean(axis=0, dtype=np.float32)
                 rate = frame.sample_rate or SAMPLE_RATE
                 if rate != SAMPLE_RATE:
