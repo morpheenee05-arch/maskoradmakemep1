@@ -523,6 +523,23 @@ class SipMediaSession:
             except (asyncio.CancelledError, Exception):
                 pass
             self._recv_task = None
+        # Per-call RTP accounting: proves our outbound audio actually left the
+        # host (OUT bytes ≈ intro length) instead of dying in the encoder.
+        try:
+            out_pk = out_b = in_pk = in_b = 0
+            for r in (await self.pc.getStats()).values():
+                if getattr(r, "type", None) == "outbound-rtp":
+                    out_pk += getattr(r, "packetsSent", 0) or 0
+                    out_b += getattr(r, "bytesSent", 0) or 0
+                elif getattr(r, "type", None) == "inbound-rtp":
+                    in_pk += getattr(r, "packetsReceived", 0) or 0
+                    in_b += getattr(r, "bytesReceived", 0) or 0
+            logger.info(
+                f"sip media stats: OUT {out_pk} pkts/{out_b // 1024}KB · "
+                f"IN {in_pk} pkts/{in_b // 1024}KB"
+            )
+        except Exception:
+            pass
         try:
             await self.pc.close()
         except Exception:

@@ -203,6 +203,41 @@ def _passes_gates(f: dict, noise_floor: float) -> bool:
     return True
 
 
+def _tone_like(f: dict, noise_floor: float) -> bool:
+    """Loud, tone-dominated window — worth diagnosing when later gates reject it."""
+    if f["rms"] < max(_RMS_FLOOR, min(_NOISE_GATE_CAP, _NOISE_MULT * noise_floor)):
+        return False
+    return f["row_share"] >= _POWER_SHARE_MIN and f["col_share"] >= _POWER_SHARE_MIN
+
+
+def _first_rejection(f: dict) -> Optional[str]:
+    """Why a tone-like window was rejected — the first failing gate, with numbers."""
+    if abs(f["row_fest"] - f["row_f"]) / f["row_f"] > _FREQ_TOL_PCT:
+        return (f"freq off: row {f['row_fest']:.0f}Hz vs {f['row_f']:.0f}Hz "
+                f"(tol {_FREQ_TOL_PCT * 100:.1f}%)")
+    if abs(f["col_fest"] - f["col_f"]) / f["col_f"] > _FREQ_TOL_PCT:
+        return (f"freq off: col {f['col_fest']:.0f}Hz vs {f['col_f']:.0f}Hz "
+                f"(tol {_FREQ_TOL_PCT * 100:.1f}%)")
+    if f["row_contrast"] < _CONTRAST_MIN or f["col_contrast"] < _CONTRAST_MIN:
+        return (f"contrast row={f['row_contrast']:.1f} col={f['col_contrast']:.1f} "
+                f"< {_CONTRAST_MIN}")
+    if f["row_sel"] < _SELECTIVITY_MIN or f["col_sel"] < _SELECTIVITY_MIN:
+        return (f"selectivity row={f['row_sel']:.1f} col={f['col_sel']:.1f} "
+                f"< {_SELECTIVITY_MIN}")
+    if not (_TWIST_MIN_DB <= f["twist_db"] <= _TWIST_MAX_DB):
+        return f"twist {f['twist_db']:.1f}dB outside {_TWIST_MIN_DB}..{_TWIST_MAX_DB}"
+    if f["row_a"] < f["guard_max"] * _GUARD_DOMINANCE:
+        return (f"guard tone louder: row {f['row_a']:.3f} vs guard "
+                f"{f['guard_max']:.3f}×{_GUARD_DOMINANCE}")
+    if f["col_a"] < f["guard_max"] * _GUARD_DOMINANCE:
+        return (f"guard tone louder: col {f['col_a']:.3f} vs guard "
+                f"{f['guard_max']:.3f}×{_GUARD_DOMINANCE}")
+    if f["row_harm"] > _HARMONIC_MAX or f["col_harm"] > _HARMONIC_MAX:
+        return (f"2nd harmonic row={f['row_harm']:.2f} col={f['col_harm']:.2f} "
+                f"> {_HARMONIC_MAX}")
+    return None
+
+
 class DTMFDetector:
     """
     Sliding-window DTMF detector with persistence checking.
@@ -247,6 +282,8 @@ class DTMFDetector:
         self._latched_key: Optional[str] = None
         # Rolling window-RMS history for the adaptive noise floor (~10s)
         self._rms_hist: deque = deque(maxlen=250)
+        # Near-miss diagnostics throttle (seconds of fed audio at last log)
+        self._last_near_miss_log = -10.0
 
     def _noise_floor(self) -> float:
         if len(self._rms_hist) < 10:
@@ -280,8 +317,21 @@ class DTMFDetector:
             self._rms_hist.append(float(np.sqrt(np.mean(window ** 2))))
 
             key = None
-            if feat is not None and _passes_gates(feat, self._noise_floor()):
-                key = feat["key"]
+            if feat is not None:
+                nf = self._noise_floor()
+                if _passes_gates(feat, nf):
+                    key = feat["key"]
+                elif _tone_like(feat, nf):
+                    # Loud, tone-dominated window that still failed a gate —
+                    # a real press being rejected looks exactly like this.
+                    reason = _first_rejection(feat)
+                    fed_s = self._total_fed / self.sample_rate
+                    if reason and fed_s - self._last_near_miss_log >= 1.5:
+                        self._last_near_miss_log = fed_s
+                        logger.info(
+                            f"dtmf near-miss '{feat['key']}' at {fed_s:.1f}s: "
+                            f"{reason} (rms={feat['rms']:.3f})"
+                        )
 
             if key is not None and key == self._latched_key:
                 # Previously confirmed press still sounding — no retrigger
@@ -329,3 +379,4 @@ class DTMFDetector:
         self._total_fed = 0
         self._latched_key = None
         self._rms_hist.clear()
+        self._last_near_miss_log = -10.0
