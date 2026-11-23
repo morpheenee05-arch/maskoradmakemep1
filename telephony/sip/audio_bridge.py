@@ -53,11 +53,16 @@ class SipAudioManager:
         self.detach_session()
         self._session = session
         session.on_audio = self._on_remote_audio
+        try:
+            session.set_on_frame_sent(self._on_frame_sent)
+        except Exception:
+            pass
 
     def detach_session(self):
         if self._session is not None:
             try:
                 self._session.on_audio = None
+                self._session.set_on_frame_sent(None)
             except Exception:
                 pass
         self._session = None
@@ -98,6 +103,21 @@ class SipAudioManager:
                 cb(data)
             except Exception:
                 pass
+
+    def _on_frame_sent(self, pcm48: bytes):
+        """float32 48k mono frame at the moment it goes on the wire → recorder.
+
+        Recording per transmitted frame (instead of the whole clip up front)
+        keeps the right channel at the call's real length when playback is
+        interrupted (voicemail / hangup / flush).
+        """
+        rec = self._recorder
+        if rec is None:
+            return
+        try:
+            rec.append_playback_float32(pcm48, OUTPUT_RATE)
+        except Exception:
+            pass
 
     # ── AudioManager-compatible API ──
 
@@ -165,12 +185,8 @@ class SipAudioManager:
             current_id = self._playback_id
         audio = np.frombuffer(raw_bytes, dtype=np.float32)
         audio = np.clip(audio, -1.0, 1.0)
-        if self._recorder is not None:
-            try:
-                self._recorder.append_playback_float32(
-                    audio.tobytes(), self._output_rate)
-            except Exception:
-                pass
+        # NOTE: no recorder tap here — recording happens per transmitted
+        # frame in _on_frame_sent, so interrupted clips don't inflate the wav.
         session = self._session
         if session is None:
             return

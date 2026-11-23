@@ -281,6 +281,9 @@ if _HAS_AIORTC:
             self._start: Optional[float] = None
             self._timestamp = 0
             self.enabled = True
+            # Tapped per transmitted frame (real-time pace) so the call
+            # recorder captures what actually went on the wire.
+            self.on_frame_sent: Optional[Callable[[bytes], None]] = None
 
         def flush(self):
             self._leftover = b""
@@ -322,8 +325,17 @@ if _HAS_AIORTC:
 
             try:
                 payload = self._queue.get_nowait()
+                got_audio = True
             except asyncio.QueueEmpty:
                 payload = b"\x00" * FRAME_BYTES
+                got_audio = False
+            if got_audio:
+                cb = self.on_frame_sent
+                if cb is not None:
+                    try:
+                        cb(payload)
+                    except Exception:
+                        pass
             samples = np.frombuffer(payload, dtype=np.float32)
             pcm16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
 
@@ -438,6 +450,10 @@ class SipMediaSession:
 
     def flush_playback(self):
         self._out_track.flush()
+
+    def set_on_frame_sent(self, cb: Optional[Callable[[bytes], None]]):
+        """Tap float32 48kHz frames at the moment they go on the wire."""
+        self._out_track.on_frame_sent = cb
 
     # ── audio in ──
 
