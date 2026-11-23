@@ -72,6 +72,10 @@ class SipPhoneClient:
         self._sip_early_media = False
         self._sip_fail_code = None
         self._sip_fail_reason = None
+        # Timestamps for BYE diagnostics (how long the call lived before the
+        # far end hung up — organic hangup vs systematic network teardown).
+        self._call_start_ts: Optional[float] = None
+        self._answered_at: Optional[float] = None
 
     # ── registration ──
 
@@ -121,6 +125,7 @@ class SipPhoneClient:
     def _on_sip_event(self, kind: str, info: dict):
         if kind == "answered":
             self._state = "active"
+            self._answered_at = time.monotonic()
             if self._answered_ev is not None:
                 self._answered_ev.set()
             sdp = info.get("sdp")
@@ -139,10 +144,21 @@ class SipPhoneClient:
             if kind == "failed":
                 self._sip_fail_code = info.get("code")
                 self._sip_fail_reason = info.get("reason")
+                logger.warning(
+                    f"sip {self._tag}: call FAILED by network: "
+                    f"{info.get('code')} {info.get('reason')}")
             elif not was_active and self._sip_fail_code is None:
                 # Pre-answer BYE — the far end gave up while we were ringing.
                 self._sip_fail_code = "bye"
                 self._sip_fail_reason = info.get("reason") or "remote ended during setup"
+                logger.info(
+                    f"sip {self._tag}: pre-answer BYE (reason={info.get('reason') or '—'})")
+            else:
+                talk = (round(time.monotonic() - self._answered_at, 1)
+                        if self._answered_at else None)
+                logger.info(
+                    f"sip {self._tag}: remote BYE after {talk}s of talk "
+                    f"(reason={info.get('reason') or '—'})")
             for ev in (self._answered_ev, self._end_ev):
                 if ev is not None:
                     ev.set()
@@ -202,6 +218,8 @@ class SipPhoneClient:
             self._sip_fail_code = None
             self._sip_fail_reason = None
             self._state = "calling"
+            self._call_start_ts = time.monotonic()
+            self._answered_at = None
             offer = await media.create_offer()
             await self._phone.start_call(phone, offer)
             self._active_calls[call_id] = phone
