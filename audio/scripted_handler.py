@@ -1101,6 +1101,12 @@ class ScriptedCallHandler:
             except Exception:
                 break
 
+        if self._result not in ("1", "2"):
+            try:
+                logger.info(f"dtmf call summary: {self._dtmf.diag_summary()}")
+            except Exception:
+                pass
+
         logger.info(
             "Scripted call handler stopped "
             f"(STT packets sent: {self._stt_send_count}, dropped: {self._stt_send_drop_count}, "

@@ -284,6 +284,13 @@ class DTMFDetector:
         self._rms_hist: deque = deque(maxlen=250)
         # Near-miss diagnostics throttle (seconds of fed audio at last log)
         self._last_near_miss_log = -10.0
+        # Per-call diagnostics: did any tone-like energy show up, and which
+        # gate rejected it (Counter of reason strings)
+        self._diag_windows = 0
+        self._diag_tone_like = 0
+        self._diag_rejections: dict[str, int] = {}
+        self._diag_best: Optional[dict] = None
+        self._diag_loudest: Optional[dict] = None
 
     def _noise_floor(self) -> float:
         if len(self._rms_hist) < 10:
@@ -315,16 +322,29 @@ class DTMFDetector:
             window = self._buffer[:self.window_size]
             feat = _analyze_window(window, self._plan)
             self._rms_hist.append(float(np.sqrt(np.mean(window ** 2))))
+            self._diag_windows += 1
 
             key = None
             if feat is not None:
                 nf = self._noise_floor()
+                gate_rms = max(_RMS_FLOOR, min(_NOISE_GATE_CAP, _NOISE_MULT * nf))
+                if feat["rms"] >= gate_rms and (
+                    self._diag_loudest is None or feat["rms"] > self._diag_loudest["rms"]
+                ):
+                    self._diag_loudest = feat
                 if _passes_gates(feat, nf):
                     key = feat["key"]
                 elif _tone_like(feat, nf):
+                    self._diag_tone_like += 1
+                    if self._diag_best is None or feat["rms"] > self._diag_best["rms"]:
+                        self._diag_best = feat
                     # Loud, tone-dominated window that still failed a gate —
                     # a real press being rejected looks exactly like this.
                     reason = _first_rejection(feat)
+                    if reason:
+                        self._diag_rejections[reason.split(":")[0]] = (
+                            self._diag_rejections.get(reason.split(":")[0], 0) + 1
+                        )
                     fed_s = self._total_fed / self.sample_rate
                     if reason and fed_s - self._last_near_miss_log >= 1.5:
                         self._last_near_miss_log = fed_s
@@ -370,6 +390,37 @@ class DTMFDetector:
 
         return detected_key
 
+    def diag_summary(self) -> str:
+        """One-line per-call digest: tone-like energy seen + rejecting gates."""
+        fed_s = self._total_fed / float(self.sample_rate or 1)
+        parts = [f"fed={fed_s:.1f}s windows={self._diag_windows} tone_like={self._diag_tone_like}"]
+        if self._diag_rejections:
+            rej = ", ".join(f"{k}×{v}" for k, v in
+                            sorted(self._diag_rejections.items(), key=lambda kv: -kv[1]))
+            parts.append(f"rejections: {rej}")
+        if self._diag_best is not None:
+            b = self._diag_best
+            parts.append(
+                f"loudest tone-like '{b['key']}': row {b['row_fest']:.0f}Hz a={b['row_a']:.3f} "
+                f"col {b['col_fest']:.0f}Hz a={b['col_a']:.3f} twist={b['twist_db']:.1f}dB "
+                f"contrast={b['row_contrast']:.1f}/{b['col_contrast']:.1f} "
+                f"sel={b['row_sel']:.1f}/{b['col_sel']:.1f} "
+                f"harm={b['row_harm']:.2f}/{b['col_harm']:.2f} guard={b['guard_max']:.3f} "
+                f"rms={b['rms']:.3f}"
+            )
+        elif self._diag_loudest is not None:
+            b = self._diag_loudest
+            parts.append(
+                f"loudest window '{b['key']}': row {b['row_fest']:.0f}Hz a={b['row_a']:.3f} "
+                f"col {b['col_fest']:.0f}Hz a={b['col_a']:.3f} twist={b['twist_db']:.1f}dB "
+                f"shares={b['row_share']:.2f}/{b['col_share']:.2f} "
+                f"contrast={b['row_contrast']:.1f}/{b['col_contrast']:.1f} "
+                f"sel={b['row_sel']:.1f}/{b['col_sel']:.1f} "
+                f"harm={b['row_harm']:.2f}/{b['col_harm']:.2f} guard={b['guard_max']:.3f} "
+                f"rms={b['rms']:.3f}"
+            )
+        return " | ".join(parts)
+
     def reset(self):
         """Clear all state for a new call."""
         self._buffer = np.zeros(0, dtype=np.float32)
@@ -380,3 +431,8 @@ class DTMFDetector:
         self._latched_key = None
         self._rms_hist.clear()
         self._last_near_miss_log = -10.0
+        self._diag_windows = 0
+        self._diag_tone_like = 0
+        self._diag_rejections = {}
+        self._diag_best = None
+        self._diag_loudest = None
