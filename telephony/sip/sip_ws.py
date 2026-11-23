@@ -498,6 +498,18 @@ class GVWebPhone:
             if msg.method == "INVITE":
                 await self._handle_invite_response(msg)
             return
+        # Retransmitted 2xx for our INVITE (branch already popped from
+        # _pending when the first 200 OK arrived): the UAS has not seen our
+        # ACK. RFC 3261 §13.2.2.4 — re-send ACK for every 2xx retransmission,
+        # or the far end's timer H (64*T1 ≈ 32s) tears the dialog down with a
+        # BYE. This is the classic "every call dies at ~30 seconds" bug.
+        d = self.dialog
+        if (d is not None and d.answered and msg.method == "INVITE"
+                and 200 <= msg.status_code < 300
+                and branch == d.invite_branch):
+            await self._send_ack(d)
+            self._emit("ack_resent", {"code": msg.status_code})
+            return
         # responses to in-dialog requests we sent (BYE/UPDATE/CANCEL/PRACK w/o track)
         log.debug("unmatched response %s %s", msg.status_code, msg.method)
 

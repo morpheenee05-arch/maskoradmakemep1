@@ -133,6 +133,15 @@ class SipPhoneClient:
                 asyncio.ensure_future(self._apply_answer(sdp))
         elif kind == "ringing":
             self._sip_ring_count += 1
+        elif kind == "ack_resent":
+            # The far end retransmitted its 200 OK — it has NOT accepted our
+            # ACK. We re-sent it; if these pile up, the dialog lives on
+            # borrowed time (timer H, BYE at ~32s after answer).
+            self._sip_ack_resent = getattr(self, "_sip_ack_resent", 0) + 1
+            logger.warning(
+                f"sip {self._tag}: far end retransmitted 200 OK — ACK re-sent "
+                f"(#{self._sip_ack_resent}); repeated lines here = our ACK is "
+                f"not being accepted (timer-H BYE at ~32s)")
         elif kind == "early_media":
             self._sip_early_media = True
             sdp = info.get("sdp")
@@ -217,6 +226,7 @@ class SipPhoneClient:
             self._sip_early_media = False
             self._sip_fail_code = None
             self._sip_fail_reason = None
+            self._sip_ack_resent = 0
             self._state = "calling"
             self._call_start_ts = time.monotonic()
             self._answered_at = None
@@ -264,6 +274,8 @@ class SipPhoneClient:
             d["sip_rings"] = self._sip_ring_count
         if self._sip_early_media:
             d["sip_early_media"] = True
+        if getattr(self, "_sip_ack_resent", 0):
+            d["ack_resent"] = self._sip_ack_resent
         if self._sip_fail_code is not None:
             d["sip_fail_code"] = self._sip_fail_code
             d["sip_fail_reason"] = self._sip_fail_reason or ""
