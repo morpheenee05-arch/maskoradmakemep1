@@ -10,8 +10,8 @@ Everything here mirrors frames captured from the real web client
 (captures/sip_flow_full.txt), including its JsSIP quirks:
   * Via host "<rand12>.invalid", branch "z9hG4bK<rand7>", ";keep" param
   * Contact user part is a separate random token
-  * initial INVITE CSeq is random; ACK reuses the dialog local CSeq
-    (i.e. after PRACKs have incremented it — non-standard but accepted)
+  * initial INVITE CSeq is random; the ACK keeps the INVITE's own CSeq
+    (RFC 3261 §13.2.2.4 — PRACK increments must not leak into the ACK)
   * CRLFCRLF WebSocket keepalive (server asks Via keep=240)
   * session timer: we are refresher=uac → UPDATE refresh at expires/2
 """
@@ -136,6 +136,7 @@ class Dialog:
     remote_uri: str
     cseq: int                                # dialog local cseq (post-INVITE)
     invite_branch: str
+    invite_cseq: int = 0                     # INVITE's own CSeq — ACK must reuse it
     remote_tag: str = ""
     remote_target: str = ""                  # Contact from 1xx/2xx
     route_set: list = field(default_factory=list)   # reversed Record-Route
@@ -448,7 +449,7 @@ class GVWebPhone:
         dialog = Dialog(
             call_id=call_id, local_tag=local_tag,
             local_uri=self._local_uri, remote_uri=remote_uri,
-            cseq=cseq, invite_branch="",
+            cseq=cseq, invite_branch="", invite_cseq=cseq,
         )
         self.dialog = dialog
 
@@ -498,18 +499,33 @@ class GVWebPhone:
             if msg.method == "INVITE":
                 await self._handle_invite_response(msg)
             return
-        # Retransmitted 2xx for our INVITE (branch already popped from
-        # _pending when the first 200 OK arrived): the UAS has not seen our
-        # ACK. RFC 3261 §13.2.2.4 — re-send ACK for every 2xx retransmission,
-        # or the far end's timer H (64*T1 ≈ 32s) tears the dialog down with a
-        # BYE. This is the classic "every call dies at ~30 seconds" bug.
+        # 2xx for our INVITE whose Via branch is no longer in _pending.
         d = self.dialog
-        if (d is not None and d.answered and msg.method == "INVITE"
+        if (d is not None and msg.method == "INVITE"
                 and 200 <= msg.status_code < 300
-                and branch == d.invite_branch):
-            await self._send_ack(d)
-            self._emit("ack_resent", {"code": msg.status_code})
+                and branch and branch == d.invite_branch):
+            if d.answered:
+                # Retransmitted 2xx (branch was popped from _pending with the
+                # first 200 OK): the UAS has not seen our ACK.
+                # RFC 3261 §13.2.2.4 — re-send ACK for every 2xx
+                # retransmission, or the far end's timer H (64*T1 ≈ 32s)
+                # tears the dialog down with a BYE.
+                await self._send_ack(d)
+                self._emit("ack_resent", {"code": msg.status_code})
+            else:
+                # The pending entry was lost (race) — never drop a real
+                # answer: the far side is waiting for our ACK and will
+                # BYE with "ACK not received" if we stay silent.
+                log.warning(
+                    "late 2xx for INVITE (pending entry gone) — answering now")
+                await self._handle_invite_response(msg)
             return
+        if msg.method == "INVITE" and 200 <= msg.status_code < 300:
+            log.warning(
+                "unmatched 2xx INVITE response: branch=%s call-id=%s cseq=%s "
+                "dialog=%s", branch, msg.header("Call-ID"),
+                msg.header("CSeq"),
+                d.invite_branch if d else None)
         # responses to in-dialog requests we sent (BYE/UPDATE/CANCEL/PRACK w/o track)
         log.debug("unmatched response %s %s", msg.status_code, msg.method)
 
@@ -584,21 +600,31 @@ class GVWebPhone:
             self._emit("prack_failed", {"rseq": rseq, "error": str(e)})
 
     async def _send_ack(self, d: Dialog):
-        msg = self._dialog_request("ACK", increment=False)
+        # RFC 3261 §13.2.2.4: the ACK's CSeq number MUST equal the INVITE's —
+        # NOT the dialog's current cseq (PRACKs have incremented it). A strict
+        # UAS/SBC can't match a wrong-CSeq ACK to the INVITE transaction,
+        # keeps retransmitting 200 OK, then drops the call: BYE with
+        # Reason "ACK not received" — seen in production at 1–2 s of talk.
+        msg = self._dialog_request("ACK", increment=False,
+                                   cseq_override=d.invite_cseq or d.cseq)
         await self._send(msg)
+        log.info("sip ACK sent for INVITE (cseq=%s call-id=%s)",
+                 d.invite_cseq or d.cseq, d.call_id)
 
-    def _dialog_request(self, method: str, increment: bool = True) -> SipMessage:
+    def _dialog_request(self, method: str, increment: bool = True,
+                        cseq_override: Optional[int] = None) -> SipMessage:
         d = self.dialog
         assert d
         if increment:
             d.cseq += 1
+        cseq = cseq_override if cseq_override is not None else d.cseq
         target = d.remote_target or d.remote_uri
         msg = self._new_request(
             method, target,
             call_id=d.call_id,
             from_uri=d.local_uri, from_tag=d.local_tag,
             to_uri=d.remote_uri, to_tag=d.remote_tag,
-            cseq=d.cseq,
+            cseq=cseq,
         )
         msg.headers = [("Route", r) for r in d.route_set] + msg.headers
         msg.headers.append(("Supported", "outbound,record-aware"))
