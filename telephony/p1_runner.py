@@ -150,6 +150,29 @@ async def _safe_release(pool, gv_client):
             pass
 
 
+def _classify_no_connect(diag: dict):
+    """Map the SIP signaling trace of a call that never reached 200 OK onto
+    an honest p1 result.
+
+    'not_answered' must mean exactly one thing — the call rang and nobody
+    picked up. Rejections (603), dead numbers (404), busy lines (486) and our
+    own media-layer deaths are different outcomes and must not pollute the
+    not_answered counter.
+    """
+    if diag.get("media_failed"):
+        return "failed", "media_failed_pre_answer"
+    code = str(diag.get("sip_fail_code") or "")
+    if code == "603":
+        return "declined", "declined(603)"
+    if code == "404":
+        return "invalid_number", "invalid_number(404)"
+    if code == "486":
+        return "busy", "busy(486)"
+    if code == "bye":
+        return "not_answered", "remote_bye_pre_answer"
+    return "not_answered", "not_answered"
+
+
 async def execute_one(
     gv_client,
     phone: str,
@@ -346,15 +369,16 @@ async def _execute_one_body(
                     extra = sd() or {}
             except Exception:
                 extra = {}
+            result, why = _classify_no_connect(extra)
             _diag_set(
-                why="not_answered",
+                why=why,
                 elapsed_s=round(time.monotonic() - t0, 1),
                 **extra,
             )
-            await _ensure_ready(gv_client, "p1 no-answer")
+            await _ensure_ready(gv_client, f"p1 {why}")
             # The handler never went live — it stays healthy for the next call.
             keep_warm = True
-            return "not_answered"
+            return result
 
         _diag_set(stage="prepare_wait")
         try:
@@ -505,8 +529,13 @@ async def _run_p1_workers(
     done = 0
     lock = asyncio.Lock()
 
-    async def worker():
+    async def worker(start_delay: float = 0.0):
         nonlocal done
+        if start_delay > 0:
+            # Stagger first dials: N simultaneous INVITEs + DTLS handshakes
+            # at t=0 reliably kill a few media sessions (observed in prod:
+            # 'DTLS handshake failed (connection error)' on start bursts).
+            await asyncio.sleep(start_delay)
         while not should_stop():
             phone = await claim_next()
             if phone is None:
@@ -597,7 +626,11 @@ async def _run_p1_workers(
                     CallRecorder.delete_paths(leftover)
 
     n_workers = max(1, len(getattr(pool, "workers", []) or [1]))
-    tasks = [asyncio.create_task(worker()) for _ in range(n_workers)]
+    stagger = max(0.0, float(getattr(config, "P1_START_STAGGER_MS", 250)) / 1000.0)
+    tasks = [
+        asyncio.create_task(worker(start_delay=stagger * i))
+        for i in range(n_workers)
+    ]
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:

@@ -163,10 +163,10 @@ class SipPhoneClient:
                 logger.info(
                     f"sip {self._tag}: pre-answer BYE (reason={info.get('reason') or '—'})")
             else:
-                talk = (round(time.monotonic() - self._answered_at, 1)
-                        if self._answered_at else None)
+                talk = (f"{round(time.monotonic() - self._answered_at, 1)}s"
+                        if self._answered_at else "unknown")
                 logger.info(
-                    f"sip {self._tag}: remote BYE after {talk}s of talk "
+                    f"sip {self._tag}: remote BYE after {talk} of talk "
                     f"(reason={info.get('reason') or '—'})")
             for ev in (self._answered_ev, self._end_ev):
                 if ev is not None:
@@ -236,7 +236,10 @@ class SipPhoneClient:
             self._fail_streak = 0
             return True
         except Exception as e:
-            logger.warning(f"sip {self._tag}: make_call failed: {e}")
+            # Full type + traceback: a bare '{e}' is empty for asyncio
+            # timeouts, which used to make this line diagnostically useless.
+            logger.opt(exception=True).warning(
+                f"sip {self._tag}: make_call failed: {type(e).__name__}: {e}")
             await self._teardown_media()
             # Back off on consecutive failures — a fast-failing client must
             # not burn the whole number queue in seconds.
@@ -276,6 +279,8 @@ class SipPhoneClient:
             d["sip_early_media"] = True
         if getattr(self, "_sip_ack_resent", 0):
             d["ack_resent"] = self._sip_ack_resent
+        if getattr(self, "_media_failed", False):
+            d["media_failed"] = True
         if self._sip_fail_code is not None:
             d["sip_fail_code"] = self._sip_fail_code
             d["sip_fail_reason"] = self._sip_fail_reason or ""

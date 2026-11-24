@@ -1019,6 +1019,13 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
             streams = int(getattr(config, "SIP_STREAMS_PER_ACCOUNT", 1) or 1)
             pool = SipPool(pool, streams_per_account=streams)
             backend_used = "sip"
+            # Register every line BEFORE the first dial — otherwise the first
+            # burst of calls pays mint+REGISTER inline and regularly times
+            # out, burning the first numbers as 'failed'.
+            try:
+                await pool.prewarm()
+            except Exception as e:
+                logger.warning(f"[job {job_id}] sip prewarm failed: {e}")
             logger.info(
                 f"[job {job_id}] p1 backend=SIP "
                 f"(streams/account={streams} → {len(pool.workers)} line(s))"
@@ -1072,7 +1079,8 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
         # Attach per-call diagnostics (stage/why/elapsed/stop flag, plus the
         # SIP signaling trace for no-answers) so the controller log shows
         # exactly WHY a call ended the way it did.
-        if result in ("cancelled", "failed", "timeout", "not_answered"):
+        if result in ("cancelled", "failed", "timeout", "not_answered",
+                      "declined", "invalid_number", "busy"):
             try:
                 from telephony.p1_runner import get_last_diag
                 d = get_last_diag()

@@ -223,6 +223,10 @@ P1_SEND_ALL_RECORDINGS = os.getenv("GV_P1_SEND_ALL_RECORDINGS", "0").strip().low
 # the dual-call test proved 2 work from one account. Clamped to 1–4 at the
 # SipPool. Remote-settable via the bot settings; applies to the next campaign.
 SIP_STREAMS_PER_ACCOUNT = _get_int_env("GV_SIP_STREAMS_PER_ACCOUNT", 1)
+# Delay between workers' first dials of a campaign (ms). A simultaneous burst
+# of INVITEs + DTLS handshakes at t=0 reliably kills a few media sessions
+# (observed: 'DTLS handshake failed (connection error)' on start bursts).
+P1_START_STAGGER_MS = _get_int_env("GV_P1_START_STAGGER_MS", 250)
 P1_RECORD_MAX_MB = _get_int_env("GV_P1_RECORD_MAX_MB", 3)
 CALL_RECORD_DIR = os.getenv("GV_CALL_RECORD_DIR", "").strip()
 # Cache credentials on the agent so a restart can sign in without the operator.

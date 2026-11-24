@@ -178,6 +178,29 @@ class SipPool:
                 asyncio.ensure_future(self._warm(client))
             return client
 
+    async def prewarm(self, concurrency: int = 4):
+        """Register every slot before the campaign starts dialing.
+
+        Without this the first N calls each pay mint+REGISTER inline, and a
+        burst of simultaneous registrations regularly times out — burning the
+        first numbers as 'failed'. Returns (ready, total).
+        """
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def _one(client):
+            async with sem:
+                try:
+                    return await client.wait_until_dialer_ready(timeout=20)
+                except Exception:
+                    return False
+
+        results = await asyncio.gather(*(_one(c) for c in self._slots))
+        ready = sum(1 for r in results if r)
+        logger.info(
+            f"sip pool prewarm: {ready}/{len(self._slots)} line(s) registered"
+        )
+        return ready, len(self._slots)
+
     async def _warm(self, client: SipPhoneClient):
         try:
             await client.wait_until_dialer_ready(timeout=15)
