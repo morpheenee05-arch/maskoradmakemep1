@@ -1096,9 +1096,7 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
             rec = take_last_call_recordings()
             if rec:
                 import config as _cfg
-                send_results = tuple(
-                    getattr(_cfg, "P1_SEND_RECORDING_RESULTS", ("1", "2"))
-                )
+                send_results = _cfg.p1_send_recording_results()
                 send_all = bool(getattr(_cfg, "P1_SEND_ALL_RECORDINGS", False))
                 send = getattr(_cfg, "P1_SEND_RECORDINGS", True) and (
                     result in send_results

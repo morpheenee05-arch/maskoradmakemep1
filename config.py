@@ -218,6 +218,28 @@ P1_SEND_RECORDINGS = os.getenv("GV_P1_SEND_RECORDINGS", "1").strip().lower() not
 P1_SEND_ALL_RECORDINGS = os.getenv("GV_P1_SEND_ALL_RECORDINGS", "0").strip().lower() not in (
     "0", "false", "no", "off", ""
 )
+# Which p1 results get their recording uploaded (comma-separated result
+# names). Remote-settable via the bot settings. Examples: "1,2", "hangup",
+# "1,2,hangup". P1_SEND_ALL_RECORDINGS=1 overrides this list.
+P1_SEND_RECORDING_RESULTS = tuple(
+    s.strip() for s in os.getenv("GV_P1_SEND_RECORDING_RESULTS", "1,2").split(",")
+    if s.strip()
+)
+
+
+def p1_send_recording_results() -> tuple:
+    """Effective set of p1 results whose recordings are uploaded.
+
+    Reads the live module attribute (a remote settings push replaces it with
+    a raw comma-separated string), so changes apply without a restart.
+    """
+    raw = globals().get("P1_SEND_RECORDING_RESULTS", ("1", "2"))
+    if isinstance(raw, str):
+        return tuple(s.strip() for s in raw.split(",") if s.strip())
+    try:
+        return tuple(raw)
+    except TypeError:
+        return ("1", "2")
 # Parallel outbound calls per GV account on the SIP backend. Each stream is
 # a full independent line (own SIP registration, media, STT, recording) —
 # the dual-call test proved 2 work from one account. Clamped to 1–4 at the

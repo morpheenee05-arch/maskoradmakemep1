@@ -660,6 +660,14 @@ async def _setting_detail_payload(context, name: str) -> tuple:
             "line with its own registration, STT and recording. "
             "Applies to the next campaign start — no restart needed."
         ),
+        "P1_SEND_RECORDING_RESULTS": (
+            "Which call results get their recording sent here — "
+            "comma-separated result names, e.g. <code>1,2</code>, "
+            "<code>hangup</code> or <code>1,2,hangup</code>. "
+            "Known results: 1, 2, hangup, voicemail, not_answered, timeout, "
+            "failed, cancelled. Note: 📡 P1_SEND_ALL_RECORDINGS=1 overrides "
+            "this list and sends everything."
+        ),
     }
     lines = [
         f"{emoji} <b>{_esc(name)}</b>",

@@ -1190,9 +1190,7 @@ async def _run_bulk_queue_workers(context, numbers, results, queue_state, chat_i
             result = results[phone].get("result")
             try:
                 import config as _cfg
-                _rec_results = set(
-                    getattr(_cfg, "P1_SEND_RECORDING_RESULTS", ("1", "2"))
-                )
+                _rec_results = set(_cfg.p1_send_recording_results())
             except Exception:
                 _rec_results = {"1", "2", "hangup"}
             if result not in _rec_results:
@@ -1278,9 +1276,7 @@ async def _run_bulk_queue_workers(context, numbers, results, queue_state, chat_i
                     recordings = handler.pop_call_recordings()
                 try:
                     import config as _cfg
-                    _rec_results = set(
-                        getattr(_cfg, "P1_SEND_RECORDING_RESULTS", ("1", "2"))
-                    )
+                    _rec_results = set(_cfg.p1_send_recording_results())
                 except Exception:
                     _rec_results = {"1", "2", "hangup"}
                 if result in _rec_results:
@@ -1513,7 +1509,12 @@ async def p1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"{emoji} `{cleaned_phone}`: {short_result}",
                 parse_mode="Markdown",
             )
-            if result in {"1", "2"} and recordings:
+            try:
+                import config as _cfg
+                _single_rec_results = set(_cfg.p1_send_recording_results())
+            except Exception:
+                _single_rec_results = {"1", "2"}
+            if result in _single_rec_results and recordings:
                 try:
                     from bot.p1_audio import send_p1_call_recordings
                     await send_p1_call_recordings(
