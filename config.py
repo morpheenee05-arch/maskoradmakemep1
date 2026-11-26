@@ -240,6 +240,15 @@ def p1_send_recording_results() -> tuple:
         return tuple(raw)
     except TypeError:
         return ("1", "2")
+# Post-call audio verification of 'hangup' results: the callee channel of the
+# call recording is re-transcribed (Deepgram prerecorded) and the result is
+# upgraded when Google's account-banned intercept is found. This is the second,
+# independent safety net behind live STT (which can miss a phrase on a
+# websocket reconnect or a final that arrives after the far end hangs up).
+# Costs one prerecorded STT request per hangup. Remote-settable.
+P1_HANGUP_AUDIO_RECHECK = os.getenv("GV_P1_HANGUP_AUDIO_RECHECK", "1").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
 # Parallel outbound calls per GV account on the SIP backend. Each stream is
 # a full independent line (own SIP registration, media, STT, recording) —
 # the dual-call test proved 2 work from one account. Clamped to 1–4 at the

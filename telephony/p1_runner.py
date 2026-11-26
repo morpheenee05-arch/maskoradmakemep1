@@ -421,6 +421,14 @@ async def _execute_one_body(
                         consec = consec + 1 if st == last else 1
                         last = st
                         if consec >= 2:
+                            # Grace beat before forcing 'hangup': the far end
+                            # often says something right before disconnecting
+                            # (carrier intercept, Google's banned-account
+                            # message). Deepgram finals lag the audio by a
+                            # fraction of a second — give the STT pipeline a
+                            # moment to land a 'voicemail'/'account_banned'
+                            # verdict instead of a blind 'hangup'.
+                            await asyncio.sleep(2.0)
                             handler.force_result("hangup")
                             return
                     else:

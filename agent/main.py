@@ -999,6 +999,93 @@ async def _publish_p1_recordings(bus, job_id, run_id, aid, phone, result, record
         CallRecorder.delete_paths(recordings)
 
 
+def _read_callee_pcm(path, max_sec: int = 90):
+    """Callee (left) channel of a call recording as raw s16 mono + rate.
+
+    Intercept messages always play at the START of the call, so the first
+    90s covers anything worth re-checking.
+    """
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(path), "rb") as w:
+        nch, sw, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+        if sw != 2:
+            return None, rate
+        frames = w.readframes(min(w.getnframes(), rate * max_sec))
+    if nch == 2:
+        arr = np.frombuffer(frames, dtype=np.int16)
+        frames = arr[0::2].tobytes()  # left channel = callee
+    return frames, rate
+
+
+def _dg_transcribe_sync(pcm: bytes, rate: int, key: str) -> str:
+    """One-shot Deepgram prerecorded transcription of raw s16 mono PCM."""
+    import json
+    import urllib.request
+
+    import config as _cfg
+
+    model = getattr(_cfg, "DG_LISTEN_MODEL", "nova-2")
+    url = (
+        f"https://api.deepgram.com/v1/listen?model={model}"
+        f"&encoding=linear16&sample_rate={rate}&channels=1"
+    )
+    req = urllib.request.Request(url, data=pcm, method="POST", headers={
+        "Authorization": f"Token {key}",
+        "Content-Type": "audio/raw",
+    })
+    with urllib.request.urlopen(req, timeout=45) as r:
+        data = json.loads(r.read())
+    chans = (data.get("results") or {}).get("channels") or []
+    if not chans:
+        return ""
+    alts = chans[0].get("alternatives") or []
+    return str(alts[0].get("transcript") or "") if alts else ""
+
+
+async def _recheck_hangup_audio(rec_path):
+    """Re-listen to the callee channel of a 'hangup' call and upgrade the
+    result when the audio carries Google's account-banned intercept.
+
+    This is the second, independent safety net behind live STT: a websocket
+    reconnect or a final that lands after the far end hangs up can make the
+    live path miss the phrase — the recording cannot miss it.
+    Returns (new_result | None, transcript).
+    """
+    if not rec_path:
+        return None, ""
+    try:
+        from infra.dg_keys import get_pool, looks_like_auth_error
+        from audio.scripted_handler import BANNED_INTERCEPT_PHRASES
+
+        loop = asyncio.get_running_loop()
+        pcm, rate = await loop.run_in_executor(None, _read_callee_pcm, rec_path)
+        if not pcm:
+            return None, ""
+        key = get_pool().current()
+        if not key:
+            return None, ""
+        try:
+            transcript = await loop.run_in_executor(
+                None, _dg_transcribe_sync, pcm, rate, key,
+            )
+        except Exception as e:
+            reason = looks_like_auth_error(e)
+            if reason:
+                get_pool().mark_bad(key, reason)
+            raise
+        low = transcript.lower()
+        for phrase in BANNED_INTERCEPT_PHRASES:
+            if phrase in low:
+                return "account_banned", transcript
+        return None, transcript
+    except Exception as e:
+        logger.debug(f"hangup audio recheck failed: {e}")
+        return None, ""
+
+
 async def _quarantine_banned_account(chrome_pool, worker, reason: str):
     """Burned GV account: kill its SIP lines, then wipe the browser profile.
 
@@ -1118,6 +1205,33 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
                 on_progress()
             except Exception:
                 pass
+        rec = None
+        try:
+            from telephony.p1_runner import take_last_call_recordings
+            rec = take_last_call_recordings()
+        except Exception:
+            rec = None
+
+        # Second, independent check behind live STT: re-transcribe the callee
+        # channel of every 'hangup' recording and upgrade the result if the
+        # audio carries Google's banned-account intercept. Live STT can miss
+        # the phrase (ws reconnect, late final) — the recording cannot.
+        if result == "hangup" and rec \
+                and getattr(config, "P1_HANGUP_AUDIO_RECHECK", True):
+            new_result, heard = await _recheck_hangup_audio(
+                rec.get("remote") or rec.get("call")
+            )
+            if heard:
+                logger.info(
+                    f"[job {job_id}] hangup recheck heard: '{heard[:180]}'"
+                )
+            if new_result:
+                logger.warning(
+                    f"[job {job_id}] hangup -> {new_result} "
+                    f"(post-call audio recheck) phone={phone}"
+                )
+                result = new_result
+
         msg = {
             "job_id": job_id, "run_id": run_id, "agent_id": aid,
             "kind": "p1_progress", "phone": phone, "result": result,
@@ -1170,9 +1284,7 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
                 logger.warning(f"[job {job_id}] account_banned handling failed: {e}")
         await bus.publish_result(msg)
         try:
-            from telephony.p1_runner import take_last_call_recordings
             from audio.call_recorder import CallRecorder
-            rec = take_last_call_recordings()
             if rec:
                 import config as _cfg
                 send_results = _cfg.p1_send_recording_results()
