@@ -61,6 +61,19 @@ VM_KEYWORDS = {
     "extension", "directory", "departments"
 }
 
+# Google Voice account-restricted intercepts. Played by GOOGLE, not the
+# callee's carrier, when our own GV account is burned (banned / calling
+# disabled): "Please enter the number from which you are calling followed by
+# the pound key…", "We are unable to complete your call…". This must never be
+# scored as voicemail — it means the ACCOUNT is dead and has to be wiped.
+# Deliberately narrow: carrier messages like "your call cannot be completed
+# as dialed" (bad destination number) use different wording and stay out.
+BANNED_INTERCEPT_PHRASES = (
+    "number from which you are calling",
+    "calling number you entered is not valid",
+    "unable to complete your call",
+)
+
 # Extra VM phrase heuristics and spoken-digit normalization.
 VM_STRONG_PHRASES = {
     "leave your message",
@@ -579,6 +592,9 @@ class ScriptedCallHandler:
         if self._result == "voicemail":
             logger.info("📵 Voicemail detected — returning early for immediate hangup")
             return "voicemail"
+        if self._result == "account_banned":
+            logger.info("🚫 Account-banned intercept during intro — hanging up")
+            return "account_banned"
 
         # ── Response Gate #1 ──
         if self._result is None:
@@ -617,6 +633,11 @@ class ScriptedCallHandler:
         # ── Play follow-up based on result ──
         if self._result == "hangup":
             return "hangup"
+        if self._result == "account_banned":
+            # Google played its account-restricted intercept — nothing to say,
+            # hang up so the account can be quarantined at once.
+            logger.info("🚫 Account-banned intercept — skipping follow-up, hanging up")
+            return "account_banned"
         if self._result == "voicemail":
             # Voicemail confirmed during the gates — do not play the
             # no_response message into a mailbox (saves ~12s per call).
@@ -1042,6 +1063,19 @@ class ScriptedCallHandler:
         else:
             self._stt_interim_count += 1
             logger.debug(f"STT (interim): '{transcript}'")
+            return
+
+        # Google account-restricted intercept — checked BEFORE voicemail
+        # scoring: this is our own burned GV account talking, not a mailbox.
+        if any(p in transcript for p in BANNED_INTERCEPT_PHRASES):
+            try:
+                self.audio.flush_output()
+            except Exception:
+                pass
+            self._set_result(
+                "account_banned",
+                f"🚫 GV ACCOUNT-BANNED intercept heard: '{transcript}'",
+            )
             return
 
         if self._vm_detection_active:

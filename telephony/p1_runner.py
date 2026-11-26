@@ -189,7 +189,7 @@ async def execute_one(
     script changes. Set GV_P1_WARM_HANDLER=0 to force cold-per-call.
 
     Returns: '1' | '2' | 'voicemail' | 'not_answered' | 'hangup' |
-             'timeout' | 'failed' | 'cancelled'.
+             'timeout' | 'failed' | 'cancelled' | 'account_banned'.
     """
     hard = max(
         60,
@@ -459,6 +459,15 @@ async def _execute_one_body(
             await monitor_task
         except (asyncio.CancelledError, Exception):
             pass
+
+        if result == "account_banned":
+            # The handler heard Google's account-restricted intercept — the
+            # GV account behind this worker is burned. The agent's on_event
+            # wipes the profile; the diag carries which worker it was.
+            _diag_set(
+                why="gv_banned_intercept",
+                elapsed_s=round(time.monotonic() - t0, 1),
+            )
 
         await _safe_hangup(gv_client, call_id)
         await _ensure_ready(gv_client, "p1 cleanup")

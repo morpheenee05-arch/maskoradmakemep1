@@ -20,6 +20,7 @@ _LABEL = {
     "voicemail": "📵 voicemail",
     "not_answered": "📵 no answer",
     "hangup": "📞 hung up",
+    "account_banned": "🚫 acc banned",
     "timeout": "⚪ timeout",
     "failed": "❌ failed",
     "cancelled": "🚫 cancelled",

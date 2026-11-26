@@ -18,6 +18,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.commands.p1_dashboard import (
     _LABEL,
+    _esc,
     completion_keyboard,
     format_completion_notice,
     format_dashboard,
@@ -157,6 +158,29 @@ async def _p1_result_loop(bot, bus, state: dict):
                                         f"🚨 {_LABEL[res]}\n"
                                         f"{format_copy_line(session, phone)}\n"
                                         f"server <code>{aid}</code>"
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                            except Exception:
+                                pass
+                        if res == "account_banned":
+                            # The agent heard Google's account-restricted
+                            # intercept mid-call and is already wiping the
+                            # profile — surface WHICH account burned.
+                            try:
+                                email = r.get("email") or "?"
+                                gvnum = r.get("gv_number") or "?"
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=(
+                                        "🚫 <b>GV account BANNED</b>\n"
+                                        f"account <code>{_esc(email)}</code>"
+                                        f" ({_esc(gvnum)})\n"
+                                        f"server <code>{aid}</code> · "
+                                        f"номер {_esc(phone)}\n"
+                                        "Услышали «unable to complete your "
+                                        "call» — cookies wiped, слот ждёт "
+                                        "/login"
                                     ),
                                     parse_mode="HTML",
                                 )

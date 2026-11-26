@@ -999,6 +999,51 @@ async def _publish_p1_recordings(bus, job_id, run_id, aid, phone, result, record
         CallRecorder.delete_paths(recordings)
 
 
+async def _quarantine_banned_account(chrome_pool, worker, reason: str):
+    """Burned GV account: kill its SIP lines, then wipe the browser profile.
+
+    Order matters: closing the SipPhoneClients first stops the current
+    campaign from dialing more numbers on the dead account (its SIP
+    registration stays technically valid even when Google refuses calls);
+    vacate_banned_account() then wipes cookies, archives a screenshot and
+    restarts Chrome onto the login page so /login can seat a fresh account.
+    """
+    wid = getattr(worker, "worker_id", "?")
+    try:
+        worker.is_authenticated = False  # SipPool.acquire parks these slots now
+        worker.is_banned = True
+    except Exception:
+        pass
+    clients = list(getattr(worker, "_sip_clients", None) or [])
+    try:
+        worker._sip_clients = []
+    except Exception:
+        pass
+    for client in clients:
+        try:
+            await asyncio.wait_for(client.close(), timeout=8)
+        except Exception:
+            pass
+    if clients:
+        logger.warning(
+            f"Worker {wid}: {len(clients)} SIP line(s) closed "
+            f"(account banned — no more calls on it)"
+        )
+    try:
+        vacate = getattr(chrome_pool, "vacate_banned_account", None)
+        if callable(vacate):
+            await vacate(worker, reason)
+    except Exception as e:
+        logger.warning(f"Worker {wid}: banned-account vacate failed: {e}")
+    finally:
+        # The slot now waits for /login — a NEW account seated here must be
+        # able to trigger the quarantine again if it gets burned too.
+        try:
+            worker._ban_quarantine_started = False
+        except Exception:
+            pass
+
+
 async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_progress=None):
     """Run a distributed /p1 run on this agent's pool, stream progress."""
     job_id = job.get("job_id")
@@ -1012,6 +1057,7 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
     ivr_timeout = int(p.get("ivr_timeout", 120))
     backend = str(p.get("backend") or "manual").lower()
     backend_used = "manual"
+    chrome_pool = pool  # PhonePool — survives the SipPool wrap below
 
     if backend == "sip":
         try:
@@ -1080,7 +1126,7 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
         # SIP signaling trace for no-answers) so the controller log shows
         # exactly WHY a call ended the way it did.
         if result in ("cancelled", "failed", "timeout", "not_answered",
-                      "declined", "invalid_number", "busy"):
+                      "declined", "invalid_number", "busy", "account_banned"):
             try:
                 from telephony.p1_runner import get_last_diag
                 d = get_last_diag()
@@ -1089,6 +1135,39 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
                     msg["detail"] = d
             except Exception:
                 pass
+        if result == "account_banned":
+            # Google played its account-restricted intercept on this call —
+            # the GV account behind the worker is burned. Find the Chrome
+            # worker, quarantine it (SIP lines closed + browser wiped) and
+            # tell the controller WHICH account died.
+            try:
+                from telephony.p1_runner import get_last_diag
+                wid = (get_last_diag() or {}).get("worker_id")
+                worker = next(
+                    (w for w in getattr(chrome_pool, "workers", [])
+                     if getattr(w, "worker_id", None) == wid),
+                    None,
+                )
+                if worker is not None:
+                    email = (
+                        getattr(worker, "account_email", None)
+                        or getattr(worker, "credential_email", None) or ""
+                    )
+                    msg["email"] = email
+                    msg["gv_number"] = getattr(worker, "phone_number", None) or ""
+                    if not getattr(worker, "_ban_quarantine_started", False):
+                        worker._ban_quarantine_started = True
+                        asyncio.ensure_future(_quarantine_banned_account(
+                            chrome_pool, worker,
+                            f"account banned by Google — call intercept "
+                            f"('unable to complete your call') on {phone}",
+                        ))
+                        logger.warning(
+                            f"[job {job_id}] ACCOUNT BANNED: worker {wid} "
+                            f"({email}) — SIP lines closing, browser wiping"
+                        )
+            except Exception as e:
+                logger.warning(f"[job {job_id}] account_banned handling failed: {e}")
         await bus.publish_result(msg)
         try:
             from telephony.p1_runner import take_last_call_recordings
