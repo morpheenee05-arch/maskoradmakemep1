@@ -71,6 +71,15 @@ async def _p1_result_loop(bot, bus, state: dict):
     redispatch_rounds = 0
     empty_confirms = 0
     end_reason = "unknown"
+    last_msg_at = now0
+    # After the last p1_progress the agent still needs seconds to publish the
+    # recording (b64-encoding a capped ~6MB wav is not instant). Breaking the
+    # moment done>=total stranded the FINAL call's p1_audio in the Redis
+    # group — progress arrived first, the loop exited, and the audio message
+    # sat unacked forever (why timeout recordings never reached the chat while
+    # small voicemail ones, published ~0.2s after progress, did).
+    TRAILING_QUIET_SEC = 10   # exit once the stream has been this quiet
+    TRAILING_HARD_SEC = 60    # absolute cap on the trailing drain
     # Diagnostics: when each agent emitted its FIRST cancelled/failed result.
     # This is the key signal for "why cancelled" — it tells us whether an agent
     # started cancelling on its own (agent bug) or only after /p1stop (expected).
@@ -90,12 +99,21 @@ async def _p1_result_loop(bot, bus, state: dict):
             logger.debug(f"p1 online-agent lookup failed: {e}")
             return set()
 
+    all_done_at: float | None = None
     try:
         while state["running"] and time.time() < deadline:
             if state.get("done", 0) >= total:
-                end_reason = "all_done"
-                break
+                # All calls reported — drain trailing p1_audio uploads (see
+                # the comment at TRAILING_QUIET_SEC) before exiting.
+                if all_done_at is None:
+                    all_done_at = time.time()
+                if (time.time() - last_msg_at > TRAILING_QUIET_SEC
+                        or time.time() - all_done_at > TRAILING_HARD_SEC):
+                    end_reason = "all_done"
+                    break
             msgs = await bus.consume_results(group, block_ms=2000)
+            if msgs:
+                last_msg_at = time.time()
             changed = False
             for entry_id, r in msgs:
                 try:

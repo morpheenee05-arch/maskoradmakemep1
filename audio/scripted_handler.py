@@ -547,6 +547,11 @@ class ScriptedCallHandler:
 
         # Wire capture → STT + DTMF detection
         self.audio.set_audio_callback(self._on_captured_audio)
+        # RFC 4733 out-of-band DTMF (SIP backend only; AudioManager has no
+        # such method — getattr keeps the manual backend untouched).
+        set_dtmf = getattr(self.audio, "set_dtmf_callback", None)
+        if set_dtmf is not None:
+            set_dtmf(self._on_external_dtmf)
         self._begin_call_recording()
         self.audio.start()
         try:
@@ -684,6 +689,24 @@ class ScriptedCallHandler:
             if key and key in ("1", "2"):
                 self.audio.flush_output()
                 self._set_result(key, f"🎯 DTMF detected: key '{key}' pressed!")
+
+    def _on_external_dtmf(self, key: str):
+        """RFC 4733 telephone-event press from the SIP stack (out-of-band DTMF).
+
+        This path exists because mobile carriers often deliver a callee's key
+        press as signaling rather than audio — then no 697/1209 Hz energy ever
+        reaches the in-band detector. Same acceptance rules as the in-band
+        path: only while a response gate is open, only 1/2 decide the call.
+        """
+        logger.info(f"dtmf telephone-event received: '{key}'")
+        if self._response_detection_active and self._result is None \
+                and key in ("1", "2"):
+            try:
+                self.audio.flush_output()
+            except Exception:
+                pass
+            self._set_result(
+                key, f"🎯 DTMF detected (telephone-event): key '{key}' pressed!")
 
     # ── STT (Speech-to-Text) ────────────────────────────────────────
 

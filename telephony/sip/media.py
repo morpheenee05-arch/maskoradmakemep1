@@ -14,8 +14,11 @@ audio flows as SRTP. This module owns exactly one call's media:
 
 Playback is a pull-model AudioStreamTrack: whatever is queued is sent,
 silence otherwise (keeps packet cadence so the far end never sees gaps).
-DTMF digits arrive in-band in the audio — the existing Goertzel detector
-in audio/ handles them, so no telephone-event parsing is needed here.
+DTMF digits arrive two ways: in-band in the audio (Goertzel detector in
+audio/) or out-of-band as RFC 4733 telephone-event RTP — the far end's
+carrier often sends DTMF as signaling, which never appears in the opus
+stream at all, so telephone-event support here is what makes key presses
+reliable on those calls (see _patch_telephone_event_codec).
 """
 from __future__ import annotations
 
@@ -206,6 +209,49 @@ def _patch_dtls_wire_dump():
 
 _patch_dtls_wire_dump()
 
+
+def _patch_telephone_event_codec():
+    """Teach aiortc's static codec table about telephone-event (RFC 4733).
+
+    aiortc has no telephone-event support and its codec-preference API only
+    accepts codecs from this hardcoded table, so appending here is the only
+    way to get 'a=rtpmap:… telephone-event/48000' into our offers. Without
+    it Google Voice has no out-of-band DTMF channel to us: when the far
+    end's carrier delivers a key press as signaling (common on mobile
+    networks), nothing audible ever reaches the opus stream and the in-band
+    detector stays silent — observed in production as a real "1" press
+    ending the call as 'timeout' with zero 697/1209 Hz energy.
+
+    Incoming telephone-event packets are intercepted in _handle_rtp_data
+    before the jitter buffer: aiortc has no decoder for them, and feeding
+    one into the decode thread raises ValueError and kills audio decoding
+    for the rest of the call.
+    """
+    if not _HAS_AIORTC:
+        return
+    try:
+        from aiortc.codecs import CODECS
+        from aiortc.rtcrtpparameters import RTCRtpCodecParameters
+        audio = CODECS["audio"]
+        if any(c.mimeType.lower() == "audio/telephone-event" for c in audio):
+            return
+        audio.append(RTCRtpCodecParameters(
+            mimeType="audio/telephone-event",
+            clockRate=48000,
+            payloadType=101,
+        ))
+        logger.info("sip media: telephone-event (RFC 4733) added to SDP offers")
+    except Exception as e:
+        logger.warning(f"sip media: telephone-event codec patch failed: {e}")
+
+
+_patch_telephone_event_codec()
+
+
+# RFC 4733 event codes → keypad characters
+_TE_EVENTS = {**{i: str(i) for i in range(10)},
+              10: "*", 11: "#", 12: "A", 13: "B", 14: "C", 15: "D"}
+
 import os
 
 # ICE never converges without STUN (host candidates only) — Chrome's web
@@ -214,7 +260,7 @@ DEFAULT_STUN = os.getenv("SIP_STUN_SERVERS", "stun:stun.l.google.com:19302")
 
 # Bumped on every media-related fix — the agent startup self-check logs it,
 # so a stale deploy is obvious from the first log lines.
-SIP_BUILD = "2026-11-19.8"
+SIP_BUILD = "2026-11-26.1"
 
 
 def enable_aiortc_logging():
@@ -361,6 +407,12 @@ class SipMediaSession:
             raise AiortcMissingError()
         self.on_audio = on_audio
         self.on_state = on_state
+        # RFC 4733 DTMF: callback(key: str) fired on telephone-event packets.
+        self.on_dtmf: Optional[Callable[[str], None]] = None
+        self._te_payload_type: Optional[int] = None  # from the answer SDP
+        self._te_last_press = None                   # dedupe one press
+        self._te_transport = None
+        self._rtp_wrapped = False
         if ice_servers is None:
             ice_servers = [
                 RTCIceServer(urls=[u.strip()])
@@ -374,6 +426,7 @@ class SipMediaSession:
         self.state = "new"
 
         self.pc.addTransceiver(self._out_track, direction="sendrecv")
+        self._transceiver = self.pc.getTransceivers()[0]
 
         @self.pc.on("track")
         def _on_track(track):
@@ -401,6 +454,7 @@ class SipMediaSession:
     async def create_offer(self) -> str:
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
+        self._wrap_rtp_intercept()
         # aiortc trickles nothing by default — localDescription is complete
         # once ICE gathering finishes.
         sdp = self.pc.localDescription.sdp
@@ -409,6 +463,70 @@ class SipMediaSession:
             f"(local candidates={sdp.count('a=candidate')})")
         return sdp
 
+    def _wrap_rtp_intercept(self):
+        """Intercept telephone-event RTP before aiortc's receiver sees it.
+
+        The receiver has no telephone-event decoder — a single such packet
+        would crash its decode thread (ValueError from get_decoder) and kill
+        inbound audio for the rest of the call. We consume matching packets
+        here and turn them into on_dtmf callbacks instead.
+        """
+        if self._rtp_wrapped:
+            return
+        try:
+            transport = self._transceiver.receiver.transport
+            if transport is None:
+                return
+            orig = transport._handle_rtp_data
+
+            async def _patched(data, arrival_time_ms, _orig=orig):
+                te_pt = self._te_payload_type
+                if (te_pt is not None and len(data) > 12
+                        and data[0] >> 6 == 2
+                        and (data[1] & 0x7F) == te_pt):
+                    self._on_te_packet(data)
+                    return
+                await _orig(data, arrival_time_ms)
+
+            transport._handle_rtp_data = _patched
+            self._te_transport = transport
+            self._rtp_wrapped = True
+        except Exception as e:
+            logger.debug(f"sip media: rtp intercept wrap failed: {e}")
+
+    def _on_te_packet(self, data: bytes):
+        """Parse one RFC 4733 telephone-event packet → on_dtmf(key)."""
+        try:
+            from aiortc.rtp import RtpPacket
+            ext_map = self._te_transport._rtp_header_extensions_map
+            packet = RtpPacket.parse(data, ext_map)
+        except Exception:
+            return
+        payload = bytes(packet.payload or b"")
+        if len(payload) < 4:
+            return
+        key = _TE_EVENTS.get(payload[0])
+        if key is None:
+            return
+        end = bool(payload[1] & 0x80)
+        volume = payload[1] & 0x3F
+        duration = int.from_bytes(payload[2:4], "big")
+        # One press = many packets sharing the same RTP timestamp (plus
+        # retransmitted end markers) — emit only on the first packet seen.
+        press_id = (packet.ssrc, packet.timestamp, payload[0])
+        if press_id == self._te_last_press:
+            return
+        self._te_last_press = press_id
+        logger.info(
+            f"sip media: telephone-event DTMF '{key}' "
+            f"(end={end} volume={volume} duration={duration})")
+        cb = self.on_dtmf
+        if cb is not None:
+            try:
+                cb(key)
+            except Exception:
+                pass
+
     async def accept_answer(self, sdp: str):
         if self.pc.signalingState != "have-local-offer":
             # A second SDP (200 OK after a reliable 183) must be identical —
@@ -416,6 +534,7 @@ class SipMediaSession:
             return
         await self.pc.setRemoteDescription(
             RTCSessionDescription(sdp=sdp, type="answer"))
+        self._te_payload_type = self._sdp_telephone_event_pt(sdp)
         n_cand = sdp.count("a=candidate")
         setup = next((l for l in sdp.splitlines() if l.startswith("a=setup")), "?")
         codecs = self._sdp_codecs(sdp)
@@ -423,6 +542,33 @@ class SipMediaSession:
             f"sip media: remote answer applied "
             f"(candidates={n_cand} {setup} ice-lite={'a=ice-lite' in sdp}) "
             f"codecs={codecs}")
+        if self._te_payload_type is not None:
+            logger.info(
+                f"sip media: telephone-event negotiated (pt="
+                f"{self._te_payload_type}) — out-of-band DTMF live")
+        else:
+            logger.info(
+                "sip media: no telephone-event in answer — DTMF is "
+                "in-band only on this call")
+
+    @staticmethod
+    def _sdp_telephone_event_pt(sdp: str) -> Optional[int]:
+        """Payload type the answer assigned to telephone-event (m=audio)."""
+        in_audio = False
+        for line in sdp.splitlines():
+            if line.startswith("m="):
+                in_audio = line.startswith("m=audio")
+            elif in_audio and line.startswith("a=rtpmap:"):
+                try:
+                    pt, desc = line[len("a=rtpmap:"):].split(None, 1)
+                except ValueError:
+                    continue
+                if desc.lower().startswith("telephone-event"):
+                    try:
+                        return int(pt)
+                    except ValueError:
+                        return None
+        return None
 
     @staticmethod
     def _sdp_codecs(sdp: str) -> str:

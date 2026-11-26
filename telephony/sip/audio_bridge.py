@@ -39,6 +39,7 @@ class SipAudioManager:
         self._initialized = False
         self._running = False
         self._sounds: dict[str, bytes] = {}
+        self._dtmf_callback: Optional[Callable[[str], None]] = None
         self._id_lock = threading.Lock()
         self._playback_id = 0
         self._logged_first_audio = False
@@ -54,6 +55,10 @@ class SipAudioManager:
         self._session = session
         session.on_audio = self._on_remote_audio
         try:
+            session.on_dtmf = self._on_dtmf_event
+        except Exception:
+            pass
+        try:
             session.set_on_frame_sent(self._on_frame_sent)
         except Exception:
             pass
@@ -62,10 +67,23 @@ class SipAudioManager:
         if self._session is not None:
             try:
                 self._session.on_audio = None
+                self._session.on_dtmf = None
                 self._session.set_on_frame_sent(None)
             except Exception:
                 pass
         self._session = None
+
+    def set_dtmf_callback(self, callback: Optional[Callable[[str], None]]):
+        """RFC 4733 out-of-band DTMF → handler (bypasses the audio path)."""
+        self._dtmf_callback = callback
+
+    def _on_dtmf_event(self, key: str):
+        cb = self._dtmf_callback
+        if cb is not None:
+            try:
+                cb(key)
+            except Exception:
+                pass
 
     # ── remote audio (from SIP media) ──
 
