@@ -311,7 +311,7 @@ async def _campaign_detail_payload(context, run_id: str) -> tuple:
         rows.append(exp_row)
         lines.append("📥 Export as .txt — or redial in one tap:")
     redial_row = []
-    for cat in ("hangup", "noanswer"):
+    for cat in ("hangup", "noanswer", "naonly"):
         if phones_for(s, cat):
             redial_row.append(InlineKeyboardButton(
                 f"🔁 Redial {category_title(cat)}",

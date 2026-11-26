@@ -354,12 +354,14 @@ def format_completion_notice(session: dict) -> str:
 EXPORT_CATEGORIES = {
     "hangup": ("hangup",),
     "noanswer": ("not_answered", "voicemail"),
+    "naonly": ("not_answered",),
     "hot": ("1", "2"),
 }
 
 _CATEGORY_TITLE = {
     "hangup": "hang ups",
     "noanswer": "no answers",
+    "naonly": "no answer only",
     "hot": "hot (pressed 1/2)",
 }
 
@@ -394,7 +396,7 @@ def completion_keyboard(session: dict) -> InlineKeyboardMarkup:
         rows.append(exp_row)
 
     redial_row: List[InlineKeyboardButton] = []
-    for cat in ("hangup", "noanswer"):
+    for cat in ("hangup", "noanswer", "naonly"):
         if phones_for(session, cat):
             redial_row.append(InlineKeyboardButton(
                 f"🔁 Redial {category_title(cat)}",
