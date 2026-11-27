@@ -26,11 +26,54 @@ from typing import Callable, Optional
 from loguru import logger
 
 from .audio_bridge import SipAudioManager
-from .gv_auth import VoiceAPIClient
+from .gv_auth import VoiceAPIClient, random_client_id, sip_register_info_body
 from .media import SipMediaSession, AiortcMissingError
 from .sip_ws import GVWebPhone, SipError
 
 REREGISTER_MARGIN = 300
+
+# One sipDeviceId per Google account, persisted across restarts. The real web
+# dialer mints a single id (voice_module_set DI token) and reuses it for every
+# sipregisterinfo/get; a fresh random id on each REGISTER looks like dozens of
+# devices on one account and is a ban signal.
+import json as _json
+import threading as _threading
+from pathlib import Path as _Path
+
+_device_id_lock = _threading.Lock()
+
+
+def _device_id_store_path() -> "_Path":
+    try:
+        import config
+        return config.BASE_DIR / ".sip_device_ids.json"
+    except Exception:
+        return _Path(".sip_device_ids.json")
+
+
+def persistent_client_id(identity: str) -> str:
+    """Return the stable sipDeviceId for one account, creating it once."""
+    identity = (identity or "").strip() or "unknown"
+    with _device_id_lock:
+        path = _device_id_store_path()
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        cid = data.get(identity)
+        if not cid:
+            cid = random_client_id()
+            data[identity] = cid
+            try:
+                path.write_text(
+                    _json.dumps(data, indent=1, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        return cid
 
 
 class SipPhoneClient:
@@ -88,7 +131,10 @@ class SipPhoneClient:
         flat = {k: (v.get("value", "") if isinstance(v, dict) else v)
                 for k, v in cookies.items()}
         api = VoiceAPIClient(flat)
-        return api.get_sip_register_info()
+        # Stable per-account sipDeviceId — the web dialer reuses ONE id for
+        # the account's whole life; a new random id per mint is what burns it.
+        cid = persistent_client_id(self.account_email or f"worker{self.worker_id}")
+        return api.get_sip_register_info(body=sip_register_info_body(cid))
 
     async def _ensure_registered(self):
         async with self._reg_lock:

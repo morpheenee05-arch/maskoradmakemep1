@@ -73,6 +73,14 @@ class SipPool:
             f"SipPool ready: {len(self._slots)} SIP line(s) = "
             f"{len(workers)} account(s) × {self._streams} stream(s)"
         )
+        if self._streams > 1:
+            # The real GV web dialer hard-blocks a second call ("You are
+            # already on a call"). Parallel calls from one account are a
+            # visible anti-fraud signal — keep SIP_STREAMS_PER_ACCOUNT=1.
+            logger.warning(
+                f"sip pool: {self._streams} streams/account — the real GV "
+                f"dialer never places parallel calls; this is a ban risk"
+            )
 
     # ── slot construction (cached on the chrome worker across campaigns) ──
 

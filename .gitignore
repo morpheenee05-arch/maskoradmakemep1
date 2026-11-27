@@ -78,3 +78,7 @@ tests-requests/
 
 # Downloaded JS dumps (reCAPTCHA probes etc.) — scraped artifacts, not source
 tools/scripts/
+
+# Per-agent SIP device-id store (keyed by account email) and browser probe dumps
+.sip_device_ids.json
+tools/gv_probe_out/
