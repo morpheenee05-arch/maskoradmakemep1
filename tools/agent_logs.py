@@ -60,7 +60,13 @@ def fmt_agent(a: dict) -> str:
 async def main_async(args) -> int:
     bus = RedisBus()
     try:
-        if not await bus.ping():
+        ok = False
+        for attempt in range(4):  # the link to Redis blips — retry a bit
+            if await bus.ping():
+                ok = True
+                break
+            await asyncio.sleep(1.5)
+        if not ok:
             print("Redis недоступен — проверь REDIS_URL в .env")
             return 1
 
