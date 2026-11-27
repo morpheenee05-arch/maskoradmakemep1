@@ -98,6 +98,78 @@ async def _publish_wipe_screenshot(bus, job_id: str, aid: str, path, caption: st
     })
 
 
+def _read_log_tail(n_lines: int, pattern: str, max_chars: int):
+    """Tail of this agent's ai-caller.log, optionally grep-filtered.
+
+    Reads only the end of the file (cap 8 MB), newest lines win. `pattern`
+    is a case-insensitive regex, falling back to a plain substring when the
+    regex does not compile. Returns (text, note).
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    candidates = [
+        _Path(getattr(config, "BASE_DIR", _Path.cwd())) / "ai-caller.log",
+        _Path("ai-caller.log"),
+    ]
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        raise FileNotFoundError("ai-caller.log not found on this agent")
+
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 8 * 1024 * 1024))
+        raw = fh.read()
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+
+    matched = lines
+    if pattern:
+        try:
+            rx = _re.compile(pattern, _re.IGNORECASE)
+            matched = [l for l in lines if rx.search(l)]
+        except _re.error:
+            needle = pattern.lower()
+            matched = [l for l in lines if needle in l.lower()]
+    matched = matched[-n_lines:]
+    text = "\n".join(matched)
+    truncated = False
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+        truncated = True
+    note = (
+        f"file={path.name} size={size // 1024}KB lines={len(matched)}"
+        f"{' grep=' + pattern if pattern else ''}"
+        f"{' TRUNCATED' if truncated else ''}"
+    )
+    return text, note
+
+
+async def _handle_logs_job(bus, job: dict):
+    """Ship the tail of this agent's log to whoever asked (tools/agent_logs.py)."""
+    job_id = job.get("job_id")
+    aid = config.AGENT_ID
+    params = job.get("params") or {}
+    try:
+        n_lines = max(1, min(3000, int(params.get("lines") or 300)))
+    except (TypeError, ValueError):
+        n_lines = 300
+    pattern = str(params.get("grep") or "").strip()
+    try:
+        max_chars = max(10_000, min(400_000, int(params.get("max_chars") or 200_000)))
+    except (TypeError, ValueError):
+        max_chars = 200_000
+    try:
+        text, note = _read_log_tail(n_lines, pattern, max_chars)
+        err = None
+    except Exception as e:
+        text, note, err = "", "", str(e)
+    await bus.publish_result({
+        "job_id": job_id, "agent_id": aid, "kind": "logs",
+        "text": text, "note": note, "error": err,
+    })
+    logger.info(f"[job {job_id}] logs tail sent ({note or err})")
+
+
 async def _handle_wipe_history_job(pool, bus, job: dict):
     """Send this agent's local wipe archive (text; optional named/latest photo)."""
     from telephony import wipe_archive
@@ -1385,9 +1457,26 @@ def _agent_version() -> str:
 
 def _capacity_payload(pool) -> dict:
     """Compact snapshot the controller needs for routing/aggregation."""
+    import socket as _socket
+
     snap = pool.get_status_snapshot()
+    try:
+        hostname = _socket.gethostname()
+    except Exception:
+        hostname = ""
+    try:
+        # No traffic is actually sent — this just asks the OS which local
+        # address would be used to reach the outside.
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = ""
     return {
         "version": _agent_version(),
+        "host": hostname,
+        "ip": local_ip,
         "state": snap["state"],
         "total_workers": snap["total_workers"],
         "ready_workers": snap["ready_workers"],
@@ -1777,6 +1866,8 @@ async def run_agent():
                         await _handle_accounts_job(pool, bus, job)
                     elif jtype == "wipe_history":
                         await _handle_wipe_history_job(pool, bus, job)
+                    elif jtype == "logs":
+                        await _handle_logs_job(bus, job)
                     elif jtype == "login":
                         # A pending pool re-init would respawn Chrome right on
                         # top of the sign-in we are about to run — cancel it.
