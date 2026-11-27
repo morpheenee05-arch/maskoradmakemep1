@@ -1212,7 +1212,10 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
     numbers = list(p.get("numbers") or [])
     profile = p.get("script_profile", "suspicious")
     script_bundle = p.get("script_bundle")
-    connect_timeout = int(p.get("connect_timeout", 30))
+    # 45s default: GV voicemail bridges answer at ~31-35s of ringing — a 30s
+    # timeout CANCELed the call right before the answer, producing phantom
+    # "no answer" results plus a 200 OK retransmit storm on the wire.
+    connect_timeout = int(p.get("connect_timeout", 45))
     ivr_timeout = int(p.get("ivr_timeout", 120))
     backend = str(p.get("backend") or "manual").lower()
     backend_used = "manual"

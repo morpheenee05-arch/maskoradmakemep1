@@ -298,7 +298,7 @@ class SipPhoneClient:
                 await asyncio.sleep(backoff)
             return False
 
-    async def wait_for_connect(self, call_id: str, timeout: int = 30) -> bool:
+    async def wait_for_connect(self, call_id: str, timeout: int = 45) -> bool:
         ev = self._answered_ev
         if ev is None:
             return False

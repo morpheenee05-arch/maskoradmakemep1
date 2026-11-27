@@ -561,10 +561,11 @@ class GVWebPhone:
             return
         if msg.method == "INVITE" and 200 <= msg.status_code < 300:
             log.warning(
-                "unmatched 2xx INVITE response: branch=%s call-id=%s cseq=%s "
-                "dialog=%s", branch, msg.header("Call-ID"),
-                msg.header("CSeq"),
-                d.invite_branch if d else None)
+                "orphan 2xx INVITE (dialog already gone) — ACK+BYE to close "
+                "it cleanly instead of letting the far end retransmit until "
+                "timer H: branch={} call-id={}", branch, msg.header("Call-ID"))
+            await self._ack_orphan_2xx(msg)
+            return
         # responses to in-dialog requests we sent (BYE/UPDATE/CANCEL/PRACK w/o track)
         log.debug("unmatched response {} {}", msg.status_code, msg.method)
 
@@ -610,8 +611,60 @@ class GVWebPhone:
                                     "call_leg_id": msg.header("X-GV-CallLegId") or ""})
         elif code >= 300:
             self._pending.pop(d.invite_branch, None)
+            self._update_dialog_from_response(d, msg)
+            # RFC 3261 §17.1.1.3: a non-2xx final response is ACKed hop-by-hop
+            # with the SAME Via branch as the INVITE (transaction-layer ACK).
+            # Without it the UAS retransmits the failure until timer H (~32s):
+            # Google was seen re-sending 487s for 35s+ after our CANCEL.
+            try:
+                ack = self._dialog_request(
+                    "ACK", increment=False,
+                    cseq_override=d.invite_cseq or d.cseq)
+                await self._send(ack, branch=d.invite_branch)
+            except Exception as e:
+                log.warning("transaction ACK for {} failed: {}", code, e)
             self._emit("failed", {"code": code, "reason": msg.reason})
             self.dialog = None
+
+    async def _ack_orphan_2xx(self, msg: SipMessage):
+        """ACK + BYE a 2xx INVITE response whose dialog is already gone
+        (typical: we CANCELed on the ring timeout and the callee / voicemail
+        answered a second later). Without this the UAS retransmits 200 OK
+        until timer H and then tears the leg down with a BYE carrying
+        Reason "ACK not received" — which also polluted our stats."""
+        to = msg.header("To") or ""
+        frm = msg.header("From") or ""
+        call_id = msg.header("Call-ID") or ""
+        cseq_hdr = msg.header("CSeq") or ""
+        cseq_num = cseq_hdr.split()[0] if cseq_hdr else ""
+        contact = (msg.header("Contact") or "").strip().strip("<>")
+        if not (to and call_id and cseq_num and contact):
+            log.warning("orphan 2xx ACK skipped — missing headers")
+            return
+        routes = [r.strip() for r in reversed(msg.headers_all("Record-Route"))]
+        ack = SipMessage(is_request=True, method="ACK", uri=contact)
+        ack.headers = [
+            ("Max-Forwards", "69"),
+            ("To", to),
+            ("From", frm),
+            ("Call-ID", call_id),
+            ("CSeq", f"{cseq_num} ACK"),
+            ("User-Agent", USER_AGENT_SIP),
+        ]
+        ack.headers = [("Route", r) for r in routes] + ack.headers
+        await self._send(ack)
+        bye = SipMessage(is_request=True, method="BYE", uri=contact)
+        bye.headers = [
+            ("Max-Forwards", "69"),
+            ("To", to),
+            ("From", frm),
+            ("Call-ID", call_id),
+            ("CSeq", "1 BYE"),
+            ("Reason", 'SIP ;cause=200 ;text="Normal call clearing"'),
+            ("User-Agent", USER_AGENT_SIP),
+        ]
+        bye.headers = [("Route", r) for r in routes] + bye.headers
+        await self._send(bye)
 
     def _update_dialog_from_response(self, d: Dialog, msg: SipMessage):
         to = msg.header("To") or ""
