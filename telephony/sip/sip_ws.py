@@ -6,14 +6,19 @@ Auth      : SIP Digest (MD5) with per-session credentials from gv_auth
 Flow      : REGISTER → 401 → REGISTER+digest → 200
             INVITE(+SDP) → 100 → 183(PRACK) → 180(PRACK) → 200 → ACK → … → BYE
 
-Everything here mirrors frames captured from the real web client
-(captures/sip_flow_full.txt), including its JsSIP quirks:
-  * Via host "<rand12>.invalid", branch "z9hG4bK<rand7>", ";keep" param
-  * Contact user part is a separate random token
-  * initial INVITE CSeq is random; the ACK keeps the INVITE's own CSeq
-    (RFC 3261 §13.2.2.4 — PRACK increments must not leak into the ACK)
+The wire profile mirrors the CURRENT web client ("Birdsong v2"), captured
+from Chrome 158 (tools/our_test/decoded_frames.txt):
+  * Via "SIP/2.0/WSS <token10>.invalid:5061;branch=z9hG4bK-524287-1---<hex20>;rport"
+    (";keep" only on REGISTER)
+  * Contact @[::]:5061 with +sip.instance (UPPERCASE uuid), reg-id=1 (REGISTER
+    only), +g.3gpp.icsi-ref and device-id params
+  * Call-ID "<base64url40>_<10-digit counter>", From-tag 8 hex chars
+  * dialog CSeq starts at 1 (INVITE cseq 1, PRACK 2/3…, ACK keeps INVITE's)
+  * first REGISTER already carries an empty-nonce Authorization header
+  * Max-Forwards 70, UA "GoogleVoice voice.web-frontend_…_p4/Birdsong v2.2.74"
+  * 200 OK to BYE carries P-RTP-Stat filled from the media layer
   * CRLFCRLF WebSocket keepalive (server asks Via keep=240)
-  * session timer: we are refresher=uac → UPDATE refresh at expires/2
+  * session timer: 200 OK says refresher=uas → the far end refreshes
 """
 from __future__ import annotations
 
@@ -33,18 +38,21 @@ from websockets.asyncio.client import connect as ws_connect
 
 WSS_URL = "wss://web.voice.telephony.goog/websocket"
 WSS_ORIGIN = "https://voice.google.com"
-USER_AGENT_SIP = "GoogleVoice voice.web-frontend_20261104.07_p3"
+USER_AGENT_SIP = "GoogleVoice voice.web-frontend_20261104.07_p4/Birdsong v2.2.74"
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36"
 )
-# base64 proto with client-info (version string + Chrome build); verbatim copy
+# base64 proto with client-info (Birdsong version string + Chrome build);
+# verbatim copy from the captured REGISTER/INVITE
 X_GOOGLE_CLIENT_INFO = (
-    "Ci1Hb29nbGVWb2ljZSB2b2ljZS53ZWItZnJvbnRlbmRfMjAyNjExMDQuMDdfcDMSLUdvb2"
-    "dsZVZvaWNlIHZvaWNlLndlYi1mcm9udGVuZF8yMDI2MTEwNC4wN19wMxgFKhBDaHJvbWUgMTU"
-    "3LjAuMC4w"
+    "Ci1Hb29nbGVWb2ljZSB2b2ljZS53ZWItZnJvbnRlbmRfMjAyNjExMDQuMDdfcDQSEEJp"
+    "cmRzb25nIHYyLjIuNzQYBSoQQ2hyb21lIDE1OC4wLjAuMA=="
 )
-ALLOW = "INVITE,ACK,CANCEL,BYE,UPDATE,MESSAGE,OPTIONS,REFER,INFO,PRACK"
+ALLOW = "INVITE, UPDATE, ACK, CANCEL, OPTIONS, BYE, PRACK, NOTIFY"
+SUPPORTED_REGISTER = "outbound, path, record-aware, replaces"
+SUPPORTED_INVITE = "outbound, path, record-aware, replaces, 100rel"
+ICSI_REF = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
 KEEPALIVE_INTERVAL = 150          # server asks keep=240; stay well below
 REGISTER_REFRESH_MARGIN = 300     # re-register this many seconds before expiry
 SESSION_REFRESH_DIV = 2           # refresh session timer at expires/2
@@ -89,12 +97,43 @@ class SipError(Exception):
         self.code = code
 
 
-def _rand_token(n: int, alphabet: str = string.ascii_lowercase + string.digits) -> str:
+# ── Birdsong-style identity generators (captured shapes) ─────────────────────
+
+_ALNUM = string.ascii_letters + string.digits
+_HEX = "0123456789abcdef"
+_CALLID_ALPHABET = _ALNUM + "-_"
+
+
+def _rand_token(n: int, alphabet: str = _ALNUM) -> str:
     return "".join(random.choice(alphabet) for _ in range(n))
 
 
 def _rand_branch() -> str:
-    return f"z9hG4bK{random.randint(1_000_000, 99_999_999)}"
+    # every captured Birdsong/SBC branch: z9hG4bK-524287-1---<20 hex>
+    return f"z9hG4bK-524287-1---{_rand_token(20, _HEX)}"
+
+
+def _rand_tag() -> str:
+    # captured From/tags are 8 lowercase hex chars
+    return _rand_token(8, _HEX)
+
+
+def _via_host_token() -> str:
+    # captured: "EZsl14-aqD", "hpmJMVHZ-T" — 9 alnum + one dash inside
+    pos = random.randint(3, 7)
+    return _rand_token(pos) + "-" + _rand_token(9 - pos)
+
+
+_CALL_ID_COUNTER = random.randint(1_000_000_000, 2_000_000_000)
+
+
+def _new_call_id() -> str:
+    # captured: "<base64url-ish 40 chars>_<10 digits>", counter creeps upward
+    global _CALL_ID_COUNTER
+    _CALL_ID_COUNTER += random.randint(5, 60)
+    if _CALL_ID_COUNTER >= 9_999_999_999:
+        _CALL_ID_COUNTER = random.randint(1_000_000_000, 2_000_000_000)
+    return f"{_rand_token(40, _CALLID_ALPHABET)}_{_CALL_ID_COUNTER}"
 
 
 # ── SIP message ──────────────────────────────────────────────────────────────
@@ -194,12 +233,12 @@ class GVWebPhone:
         self.on_event = on_event or (lambda kind, info: None)
         self.place_call_context = place_call_context   # X-GV-PlaceCallContext jspb
 
-        # JsSIP-style stable identities for the registration
-        self._via_host = f"{_rand_token(12)}.invalid"
-        self._contact_user = _rand_token(8)
-        self._instance_id = str(uuid.uuid4())
-        self._reg_call_id = _rand_token(20, string.hexdigits.lower()[:16] + "abcdef")
-        self._reg_from_tag = _rand_token(10)
+        # Birdsong-style stable identities for the registration
+        self._via_host = f"{_via_host_token()}.invalid"
+        self._device_id = _rand_token(12)
+        self._instance_id = str(uuid.uuid4()).upper()
+        self._reg_call_id = _new_call_id()
+        self._reg_from_tag = _rand_tag()
         self._reg_cseq = 0
         self._service_route: Optional[str] = None
         self._reg_expires = 3600
@@ -213,6 +252,11 @@ class GVWebPhone:
         self._pending: dict[str, asyncio.Future] = {}   # branch → Future[SipMessage]
         self.dialog: Optional[Dialog] = None
         self.sdp_answerer: Optional[SdpAnswerer] = None  # for in-dialog offers
+        # Fills P-RTP-Stat on our 200 OK to BYE (wired to the media layer).
+        self.rtp_stat_provider: Optional[Callable[[], str]] = None
+        # INVITEs we abandoned via CANCEL: their final failure (487) still
+        # needs a transaction-layer ACK or the SBC retransmits it ~32 s.
+        self._zombies: dict[str, dict] = {}             # call_id → invite data
         self._p_associated = ""
         self._closed = False
         self._is_registered = False
@@ -237,20 +281,37 @@ class GVWebPhone:
             log.info("sip-trace {}", _trace_line(direction, msg))
 
     @property
-    def _local_uri(self) -> str:
-        # JsSIP percent-encodes the user part: base64 '=' shows up as %3D on
-        # the wire (digest still uses the raw username)
-        user = (self.creds.username
-                .replace("%", "%25").replace("+", "%2B")
-                .replace("/", "%2F").replace("=", "%3D"))
-        return f"sip:{user}@{self.creds.domain}"
+    def _reg_uri(self) -> str:
+        # REGISTER identity — the long SIP username, sent RAW (the current
+        # web client no longer percent-encodes the trailing '=')
+        return f"sip:{self.creds.username}@{self.creds.domain}"
+
+    @property
+    def _device_uri(self) -> str:
+        # dialog identity (INVITE From / Contact user) — the device-id
+        return f"sip:{self._device_id}@{self.creds.domain}"
+
+    def _reg_contact(self) -> str:
+        # REGISTER Contact: long username + reg-id (captured shape)
+        return (f"<sip:{self.creds.username}@[::]:5061;transport=wss>"
+                f';+sip.instance="<urn:uuid:{self._instance_id}>"'
+                f";reg-id=1"
+                f';+g.3gpp.icsi-ref="{ICSI_REF}"'
+                f';device-id="{self._device_id}"')
+
+    def _dialog_contact(self) -> str:
+        # in-dialog Contact: device-id user, no reg-id (captured shape)
+        return (f"<sip:{self._device_id}@[::]:5061;transport=wss>"
+                f';+sip.instance="<urn:uuid:{self._instance_id}">'
+                f';+g.3gpp.icsi-ref="{ICSI_REF}"'
+                f';device-id="{self._device_id}"')
 
     async def _send(self, msg: SipMessage, branch: Optional[str] = None) -> str:
         branch = branch or _rand_branch()
-        msg.headers.insert(0, (
-            "Via",
-            f"SIP/2.0/wss {self._via_host};branch={branch};keep",
-        ))
+        via = (f"SIP/2.0/WSS {self._via_host}:5061;branch={branch};rport")
+        if msg.method == "REGISTER":
+            via += ";keep"            # captured: ";keep" only on REGISTER
+        msg.headers.insert(0, ("Via", via))
         data = msg.to_bytes()
         log.debug("SIP C→S\n{}", data.decode(errors="replace"))
         self._trace("C→S", msg)
@@ -266,23 +327,6 @@ class GVWebPhone:
         self._pending[branch] = fut
         await self._send(msg, branch)
         return branch, fut
-
-    def _new_request(self, method: str, uri: str, *, call_id: str,
-                     from_uri: str, from_tag: str, to_uri: str, to_tag: str = "",
-                     cseq: int) -> SipMessage:
-        to = f"<{to_uri}>" + (f";tag={to_tag}" if to_tag else "")
-        msg = SipMessage(is_request=True, method=method, uri=uri)
-        msg.headers = [
-            ("Max-Forwards", "69"),
-            ("To", to),
-            ("From", f"<{from_uri}>;tag={from_tag}"),
-            ("Call-ID", call_id),
-            ("CSeq", f"{cseq} {method}"),
-            ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
-            ("Allow", ALLOW),
-            ("User-Agent", USER_AGENT_SIP),
-        ]
-        return msg
 
     async def _request(self, msg: SipMessage, timeout: float = 20.0) -> SipMessage:
         """Send a request and wait for its final response."""
@@ -362,7 +406,7 @@ class GVWebPhone:
     async def register(self):
         """REGISTER with digest retry; returns when 200 OK received."""
         self._reg_cseq += 1
-        msg = self._register_message(self._reg_cseq)
+        msg = self._register_message(self._reg_cseq, self._auth_empty())
         resp = await self._request(msg)
 
         if resp.status_code == 401:
@@ -371,8 +415,7 @@ class GVWebPhone:
                 f"sip:{self.creds.domain}",
             )
             self._reg_cseq += 1
-            msg = self._register_message(self._reg_cseq)
-            msg.headers.insert(4, ("Authorization", auth))
+            msg = self._register_message(self._reg_cseq, auth)
             resp = await self._request(msg)
 
         if resp.status_code != 200:
@@ -394,30 +437,32 @@ class GVWebPhone:
         self._emit("registered", {"expires": self._reg_expires,
                                   "p_associated": bool(self._p_associated)})
 
-    def _register_message(self, cseq: int) -> SipMessage:
-        msg = self._new_request(
-            "REGISTER", f"sip:{self.creds.domain}",
-            call_id=self._reg_call_id,
-            from_uri=self._local_uri, from_tag=self._reg_from_tag,
-            to_uri=self._local_uri,
-            cseq=cseq,
-        )
-        # order matches the capture: Contact/Expires before Allow
+    def _auth_empty(self) -> str:
+        # captured: the FIRST REGISTER already carries a Digest header with
+        # empty nonce/response (no algorithm param, no spaces after commas)
+        return (f'Digest username="{self.creds.username}",'
+                f'realm="{self.creds.realm}",'
+                f'uri="sip:{self.creds.domain}",nonce="",response=""')
+
+    def _register_message(self, cseq: int, auth: str) -> SipMessage:
+        # captured header order: Via, Max-Forwards, Contact, To, From,
+        # Call-ID, CSeq, Expires, Allow, Supported, User-Agent,
+        # Authorization, X-Google-Client-Info
+        msg = SipMessage(is_request=True, method="REGISTER",
+                         uri=f"sip:{self.creds.domain}")
         msg.headers = [
-            ("Max-Forwards", "69"),
-            ("To", f"<{self._local_uri}>"),
-            ("From", f"<{self._local_uri}>;tag={self._reg_from_tag}"),
+            ("Max-Forwards", "70"),
+            ("Contact", self._reg_contact()),
+            ("To", f"<{self._reg_uri}>"),
+            ("From", f"<{self._reg_uri}>;tag={self._reg_from_tag}"),
             ("Call-ID", self._reg_call_id),
             ("CSeq", f"{cseq} REGISTER"),
-            ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
-            ("Contact",
-             f"<sip:{self._contact_user}@{self._via_host};transport=wss>"
-             f';+sip.ice;reg-id=1;+sip.instance="<urn:uuid:{self._instance_id}>"'
-             ";expires=3600"),
             ("Expires", "3600"),
             ("Allow", ALLOW),
-            ("Supported", "path,gruu,outbound,record-aware"),
+            ("Supported", SUPPORTED_REGISTER),
             ("User-Agent", USER_AGENT_SIP),
+            ("Authorization", auth),
+            ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
         ]
         return msg
 
@@ -443,11 +488,10 @@ class GVWebPhone:
         ).hexdigest()
         ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
         response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
-        return (
-            f'Digest algorithm=MD5, username="{self.creds.username}", '
-            f'realm="{realm}", nonce="{nonce}", uri="{uri}", '
-            f'response="{response}"'
-        )
+        # captured param order: username,realm,nonce,uri,response,algorithm
+        return (f'Digest username="{self.creds.username}",'
+                f'realm="{realm}",nonce="{nonce}",uri="{uri}",'
+                f'response="{response}",algorithm=MD5')
 
     # ── outgoing call ──
 
@@ -460,35 +504,39 @@ class GVWebPhone:
             raise SipError("call already in progress")
         number = re.sub(r"[^\d+]", "", number)
         remote_uri = f"sip:{number}@{self.creds.domain}"
-        call_id = str(uuid.uuid4()).upper()
-        local_tag = _rand_token(10)
-        cseq = random.randint(1000, 8000)
+        call_id = _new_call_id()
+        local_tag = _rand_tag()
 
-        msg = self._new_request(
-            "INVITE", remote_uri,
-            call_id=call_id, from_uri=self._local_uri, from_tag=local_tag,
-            to_uri=remote_uri, cseq=cseq,
-        )
+        # captured header order: Via, Max-Forwards, Route, Contact, To,
+        # From, Call-ID, CSeq, Allow, Content-Type, Supported, User-Agent,
+        # P-Preferred-Identity, X-Google-Client-Info, X-GV-PlaceCallContext
+        msg = SipMessage(is_request=True, method="INVITE", uri=remote_uri)
+        msg.headers = [("Max-Forwards", "70")]
         if self._service_route:
-            # capture: lr=lr quirk preserved verbatim
-            msg.headers.insert(0, ("Route", self._service_route.replace(";lr", ";lr=lr", 1)))
-        msg.headers.append(("P-Preferred-Identity", self._p_associated or self._local_uri))
+            msg.headers.append(("Route", f"<{self._service_route}>"))
+        msg.headers += [
+            ("Contact", self._dialog_contact()),
+            ("To", f"<{remote_uri}>"),
+            ("From", f"<{self._device_uri}>;tag={local_tag}"),
+            ("Call-ID", call_id),
+            ("CSeq", "1 INVITE"),
+            ("Allow", ALLOW),
+            ("Content-Type", "application/sdp"),
+            ("Supported", SUPPORTED_INVITE),
+            ("User-Agent", USER_AGENT_SIP),
+            ("P-Preferred-Identity",
+             f"<{self._p_associated or self._reg_uri}>"),
+            ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
+        ]
         if self.place_call_context:
             msg.headers.append(
                 ("X-GV-PlaceCallContext", f"jspb={self.place_call_context}"))
-        msg.headers.append((
-            "Contact",
-            f"<sip:{self._contact_user}@{self._via_host};transport=wss>",
-        ))
-        msg.headers.append(("Content-Type", "application/sdp"))
-        msg.headers.append(("Session-Expires", "90"))
-        msg.headers.append(("Supported", "timer,100rel,ice,replaces,outbound,record-aware"))
         msg.body = sdp_offer
 
         dialog = Dialog(
             call_id=call_id, local_tag=local_tag,
-            local_uri=self._local_uri, remote_uri=remote_uri,
-            cseq=cseq, invite_branch="", invite_cseq=cseq,
+            local_uri=self._device_uri, remote_uri=remote_uri,
+            cseq=1, invite_branch="", invite_cseq=1,
         )
         self.dialog = dialog
 
@@ -510,11 +558,26 @@ class GVWebPhone:
             if d.answered:
                 await self._send_in_dialog("BYE")
             else:
-                # cancel the pending INVITE
-                d.cseq += 1
-                msg = self._dialog_request("CANCEL")
-                msg.headers.append(("Reason", 'SIP ;cause=487 ;text="Cancelled"'))
-                await self._send(msg)
+                # RFC 3261 §9.1: CANCEL must reuse the INVITE's Via branch and
+                # CSeq number, or the SBC answers 481 and keeps the INVITE
+                # alive (the "late 200 OK after our timeout" storm).
+                msg = SipMessage(is_request=True, method="CANCEL",
+                                 uri=d.remote_uri)
+                msg.headers = [("Max-Forwards", "70")]
+                if self._service_route:
+                    msg.headers.append(("Route", f"<{self._service_route}>"))
+                msg.headers += [
+                    ("Contact", self._dialog_contact()),
+                    ("To", f"<{d.remote_uri}>"),
+                    ("From", f"<{d.local_uri}>;tag={d.local_tag}"),
+                    ("Call-ID", d.call_id),
+                    ("CSeq", f"{d.invite_cseq} CANCEL"),
+                    ("User-Agent", USER_AGENT_SIP),
+                    ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
+                    ("Reason", 'SIP ;cause=487 ;text="Cancelled"'),
+                ]
+                await self._send(msg, branch=d.invite_branch)
+                self._stash_zombie(d)
         finally:
             # The dialog is over once BYE/CANCEL is on the wire — keeping it
             # blocked every later start_call with "call already in progress".
@@ -565,6 +628,13 @@ class GVWebPhone:
                 "it cleanly instead of letting the far end retransmit until "
                 "timer H: branch={} call-id={}", branch, msg.header("Call-ID"))
             await self._ack_orphan_2xx(msg)
+            return
+        if msg.method == "INVITE" and msg.status_code >= 300:
+            # Final failure for an INVITE we already abandoned via CANCEL
+            # (typically 487). It still needs its transaction-layer ACK.
+            z = self._zombies.get(msg.header("Call-ID") or "")
+            if z:
+                await self._ack_zombie(msg, z)
             return
         # responses to in-dialog requests we sent (BYE/UPDATE/CANCEL/PRACK w/o track)
         log.debug("unmatched response {} {}", msg.status_code, msg.method)
@@ -626,6 +696,43 @@ class GVWebPhone:
             self._emit("failed", {"code": code, "reason": msg.reason})
             self.dialog = None
 
+    def _stash_zombie(self, d: Dialog):
+        self._zombies[d.call_id] = {
+            "ts": time.time(),
+            "remote_uri": d.remote_uri,
+            "local_uri": d.local_uri,
+            "local_tag": d.local_tag,
+            "invite_cseq": d.invite_cseq,
+            "invite_branch": d.invite_branch,
+            "route_set": list(d.route_set),
+        }
+        for cid, z in list(self._zombies.items()):
+            if time.time() - z["ts"] > 90:
+                self._zombies.pop(cid, None)
+
+    async def _ack_zombie(self, msg: SipMessage, z: dict):
+        """Transaction-layer ACK (same branch) for a final failure of an
+        INVITE we already abandoned with CANCEL — the 487 otherwise gets
+        retransmitted by the SBC for ~32 s for no reason."""
+        try:
+            to = msg.header("To") or f"<{z['remote_uri']}>"
+            ack = SipMessage(is_request=True, method="ACK",
+                             uri=z["remote_uri"])
+            ack.headers = [("Max-Forwards", "70")]
+            ack.headers += [("Route", r) for r in z["route_set"]]
+            ack.headers += [
+                ("Contact", self._dialog_contact()),
+                ("To", to),
+                ("From", f"<{z['local_uri']}>;tag={z['local_tag']}"),
+                ("Call-ID", msg.header("Call-ID") or ""),
+                ("CSeq", f"{z['invite_cseq']} ACK"),
+                ("User-Agent", USER_AGENT_SIP),
+                ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
+            ]
+            await self._send(ack, branch=z["invite_branch"])
+        except Exception as e:
+            log.warning("zombie ACK failed: {}", e)
+
     async def _ack_orphan_2xx(self, msg: SipMessage):
         """ACK + BYE a 2xx INVITE response whose dialog is already gone
         (typical: we CANCELed on the ring timeout and the callee / voicemail
@@ -642,29 +749,28 @@ class GVWebPhone:
             log.warning("orphan 2xx ACK skipped — missing headers")
             return
         routes = [r.strip() for r in reversed(msg.headers_all("Record-Route"))]
-        ack = SipMessage(is_request=True, method="ACK", uri=contact)
-        ack.headers = [
-            ("Max-Forwards", "69"),
-            ("To", to),
-            ("From", frm),
-            ("Call-ID", call_id),
-            ("CSeq", f"{cseq_num} ACK"),
-            ("User-Agent", USER_AGENT_SIP),
-        ]
-        ack.headers = [("Route", r) for r in routes] + ack.headers
-        await self._send(ack)
-        bye = SipMessage(is_request=True, method="BYE", uri=contact)
-        bye.headers = [
-            ("Max-Forwards", "69"),
-            ("To", to),
-            ("From", frm),
-            ("Call-ID", call_id),
-            ("CSeq", "1 BYE"),
+
+        def _req(method: str, cseq: str, extra: Optional[list] = None):
+            req = SipMessage(is_request=True, method=method, uri=contact)
+            req.headers = [("Max-Forwards", "70")]
+            req.headers += [("Route", r) for r in routes]
+            req.headers += [
+                ("Contact", self._dialog_contact()),
+                ("To", to),
+                ("From", frm),
+                ("Call-ID", call_id),
+                ("CSeq", cseq),
+                ("User-Agent", USER_AGENT_SIP),
+                ("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO),
+            ]
+            for h in (extra or []):
+                req.headers.append(h)
+            return req
+
+        await self._send(_req("ACK", f"{cseq_num} ACK"))
+        await self._send(_req("BYE", "1 BYE", extra=[
             ("Reason", 'SIP ;cause=200 ;text="Normal call clearing"'),
-            ("User-Agent", USER_AGENT_SIP),
-        ]
-        bye.headers = [("Route", r) for r in routes] + bye.headers
-        await self._send(bye)
+        ]))
 
     def _update_dialog_from_response(self, d: Dialog, msg: SipMessage):
         to = msg.header("To") or ""
@@ -681,9 +787,10 @@ class GVWebPhone:
     async def _send_prack(self, d: Dialog, prov: SipMessage):
         rseq = prov.header("RSeq") or "0"
         cseq_hdr = prov.header("CSeq") or ""
-        invite_cseq = cseq_hdr.split()[0] if cseq_hdr else str(d.cseq)
-        msg = self._dialog_request("PRACK")
-        msg.headers.append(("RAck", f"{rseq} {invite_cseq} INVITE"))
+        invite_cseq = cseq_hdr.split()[0] if cseq_hdr else str(d.invite_cseq)
+        # captured order: …, CSeq, User-Agent, RAck, X-Google-Client-Info
+        msg = self._dialog_request(
+            "PRACK", extra=[("RAck", f"{rseq} {invite_cseq} INVITE")])
         try:
             resp = await self._request(msg, timeout=15)
             log.info("PRACK rseq={} -> {}", rseq, resp.status_code)
@@ -704,33 +811,43 @@ class GVWebPhone:
                  d.invite_cseq or d.cseq, d.call_id)
 
     def _dialog_request(self, method: str, increment: bool = True,
-                        cseq_override: Optional[int] = None) -> SipMessage:
+                        cseq_override: Optional[int] = None,
+                        extra: Optional[list] = None) -> SipMessage:
+        # captured order (PRACK/ACK/BYE): Via, Max-Forwards, Route…,
+        # Contact, To, From, Call-ID, CSeq, User-Agent, [extra],
+        # X-Google-Client-Info
         d = self.dialog
         assert d
         if increment:
             d.cseq += 1
         cseq = cseq_override if cseq_override is not None else d.cseq
         target = d.remote_target or d.remote_uri
-        msg = self._new_request(
-            method, target,
-            call_id=d.call_id,
-            from_uri=d.local_uri, from_tag=d.local_tag,
-            to_uri=d.remote_uri, to_tag=d.remote_tag,
-            cseq=cseq,
-        )
-        msg.headers = [("Route", r) for r in d.route_set] + msg.headers
-        msg.headers.append(("Supported", "outbound,record-aware"))
+        to = f"<{d.remote_uri}>" + (f";tag={d.remote_tag}" if d.remote_tag else "")
+        msg = SipMessage(is_request=True, method=method, uri=target)
+        msg.headers = [("Max-Forwards", "70")]
+        msg.headers += [("Route", r) for r in d.route_set]
+        msg.headers += [
+            ("Contact", self._dialog_contact()),
+            ("To", to),
+            ("From", f"<{d.local_uri}>;tag={d.local_tag}"),
+            ("Call-ID", d.call_id),
+            ("CSeq", f"{cseq} {method}"),
+            ("User-Agent", USER_AGENT_SIP),
+        ]
+        for h in (extra or []):
+            msg.headers.append(h)
+        msg.headers.append(("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO))
         return msg
 
     async def _send_in_dialog(self, method: str, body: str = "",
                               content_type: str = ""):
-        msg = self._dialog_request(method)
+        extra = [("Content-Type", content_type)] if content_type else None
+        msg = self._dialog_request(method, extra=extra)
         if body:
-            msg.headers.append(("Content-Type", content_type))
             msg.body = body
         return await self._request(msg)
 
-    # ── session timer (we are refresher=uac) ──
+    # ── session timer (only if the 200 OK makes us the refresher) ──
 
     def _arm_session_refresh(self, d: Dialog):
         if self._session_refresh_task:
@@ -746,9 +863,10 @@ class GVWebPhone:
                 if self.dialog is not d or not d.answered:
                     return
                 try:
-                    msg = self._dialog_request("UPDATE")
-                    msg.headers.append(
-                        ("Session-Expires", f"{d.session_expires};refresher=uac"))
+                    msg = self._dialog_request("UPDATE", extra=[
+                        ("Session-Expires",
+                         f"{d.session_expires};refresher=uac"),
+                    ])
                     await self._request(msg, timeout=15)
                 except Exception as e:
                     log.warning("session refresh failed: {}", e)
@@ -762,9 +880,16 @@ class GVWebPhone:
     async def _handle_incoming_request(self, msg: SipMessage):
         method = msg.method
         if method == "BYE":
+            stat = ""
+            if self.rtp_stat_provider:
+                try:
+                    stat = self.rtp_stat_provider() or ""
+                except Exception:
+                    stat = ""
+            if not stat:
+                stat = "PS=0, OS=0, PR=0, OR=0, PL=0, JI=0, LA=0, DU=0, NP=0"
             await self._respond(msg, 200, "OK", extra=[
-                ("P-RTP-Stat", ""),           # filled by media layer later
-                ("Reason", 'Google ;cause=0 ;text=""'),
+                ("P-RTP-Stat", stat),
             ])
             if self.dialog:
                 self._pending.pop(self.dialog.invite_branch, None)
@@ -805,16 +930,24 @@ class GVWebPhone:
     async def _respond(self, req: SipMessage, code: int, reason: str,
                        body: str = "", content_type: str = "",
                        extra: Optional[list] = None):
+        # captured 200-to-BYE order: Via…, Record-Route…, Contact, To, From,
+        # Call-ID, CSeq, User-Agent, X-Google-Client-Info, P-RTP-Stat
         resp = SipMessage(is_request=False, status_code=code, reason=reason)
         resp.headers = [(n, v) for n, v in req.headers
-                        if n.lower() in ("via", "to", "from", "call-id", "cseq")]
-        # make sure To carries our local tag for in-dialog responses
+                        if n.lower() == "via"]
+        resp.headers += [(n, v) for n, v in req.headers
+                         if n.lower() == "record-route"]
         d = self.dialog
+        if d:
+            resp.headers.append(("Contact", self._dialog_contact()))
+        resp.headers += [(n, v) for n, v in req.headers
+                         if n.lower() in ("to", "from", "call-id", "cseq")]
+        # make sure To carries our local tag for in-dialog responses
         if d and req.method != "INVITE":
             for i, (n, v) in enumerate(resp.headers):
                 if n.lower() == "to" and "tag=" not in v:
                     resp.headers[i] = (n, f"{v};tag={d.local_tag}")
-        resp.headers.append(("Supported", "outbound,record-aware"))
+        resp.headers.append(("User-Agent", USER_AGENT_SIP))
         resp.headers.append(("X-Google-Client-Info", X_GOOGLE_CLIENT_INFO))
         for h in (extra or []):
             resp.headers.append(h)

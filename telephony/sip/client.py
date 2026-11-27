@@ -265,6 +265,8 @@ class SipPhoneClient:
                 return False
             self._media = media
             self.sip_audio.bind_session(media)
+            if self._phone is not None:
+                self._phone.rtp_stat_provider = media.rtp_stat
             self._answered_ev = asyncio.Event()
             self._end_ev = asyncio.Event()
             self._media_failed = False

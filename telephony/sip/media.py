@@ -18,7 +18,7 @@ DTMF digits arrive two ways: in-band in the audio (Goertzel detector in
 audio/) or out-of-band as RFC 4733 telephone-event RTP — the far end's
 carrier often sends DTMF as signaling, which never appears in the opus
 stream at all, so telephone-event support here is what makes key presses
-reliable on those calls (see _patch_telephone_event_codec).
+reliable on those calls (see _patch_chrome_codec_table).
 """
 from __future__ import annotations
 
@@ -210,17 +210,19 @@ def _patch_dtls_wire_dump():
 _patch_dtls_wire_dump()
 
 
-def _patch_telephone_event_codec():
-    """Teach aiortc's static codec table about telephone-event (RFC 4733).
+def _patch_chrome_codec_table():
+    """Shape aiortc's static codec table like Chrome 158's audio offer.
 
-    aiortc has no telephone-event support and its codec-preference API only
-    accepts codecs from this hardcoded table, so appending here is the only
-    way to get 'a=rtpmap:… telephone-event/48000' into our offers. Without
-    it Google Voice has no out-of-band DTMF channel to us: when the far
-    end's carrier delivers a key press as signaling (common on mobile
-    networks), nothing audible ever reaches the opus stream and the in-band
-    detector stays silent — observed in production as a real "1" press
-    ending the call as 'timeout' with zero 697/1209 Hz energy.
+    The captured web client offers 'm=audio … 111 63 9 0 8 13 110 101'
+    (opus, red, G722, PCMU, PCMA, CN, telephone-event/48000, telephone-event
+    /8000) and Google's SBC mirrors the offer's payload types in its answer,
+    so the pts must be exact, not arbitrary. aiortc's stock table is
+    '96 9 0 8' (+101 te via our old patch) — visibly non-Chrome to anyone
+    inspecting the INVITE.
+
+    red (63) and CN (13) have no encoder/decoder in aiortc — that is fine:
+    the send codec is negotiated as opus (Google always picks 111), and
+    incoming red/CN packets never arrive because the answer omits them.
 
     Incoming telephone-event packets are intercepted in _handle_rtp_data
     before the jitter buffer: aiortc has no decoder for them, and feeding
@@ -233,19 +235,124 @@ def _patch_telephone_event_codec():
         from aiortc.codecs import CODECS
         from aiortc.rtcrtpparameters import RTCRtpCodecParameters
         audio = CODECS["audio"]
-        if any(c.mimeType.lower() == "audio/telephone-event" for c in audio):
-            return
-        audio.append(RTCRtpCodecParameters(
-            mimeType="audio/telephone-event",
-            clockRate=48000,
-            payloadType=101,
-        ))
-        logger.info("sip media: telephone-event (RFC 4733) added to SDP offers")
+        if any(c.payloadType == 111 for c in audio):
+            return                          # already shaped
+        keep = {c.payloadType: c for c in audio}  # reuse G722/PCMU/PCMA objs
+        CODECS["audio"] = [
+            RTCRtpCodecParameters(
+                mimeType="audio/opus", clockRate=48000, channels=2,
+                payloadType=111),
+            RTCRtpCodecParameters(
+                mimeType="audio/red", clockRate=48000, channels=2,
+                payloadType=63),
+            keep[9],                        # G722
+            keep[0],                        # PCMU
+            keep[8],                        # PCMA
+            RTCRtpCodecParameters(
+                mimeType="audio/CN", clockRate=8000, channels=1,
+                payloadType=13),
+            RTCRtpCodecParameters(
+                mimeType="audio/telephone-event", clockRate=48000,
+                payloadType=110),
+            RTCRtpCodecParameters(
+                mimeType="audio/telephone-event", clockRate=8000,
+                payloadType=101),
+        ]
+        logger.info("sip media: codec table shaped like Chrome "
+                    "(111 63 9 0 8 13 110 101)")
     except Exception as e:
-        logger.warning(f"sip media: telephone-event codec patch failed: {e}")
+        logger.warning(f"sip media: codec table patch failed: {e}")
 
 
-_patch_telephone_event_codec()
+_patch_chrome_codec_table()
+
+
+def _chrome_shaped_offer(sdp: str) -> str:
+    """Rewrite aiortc's offer SDP into Chrome 158's exact layout.
+
+    The payload types are already correct (the codec table is patched), so
+    this only re-orders attributes, drops aiortc-isms (3 fingerprints,
+    uuid cname, 'msid-semantic:WMS *', real c= IP/port) and adds Chrome-isms
+    (extmap-allow-mixed, ice-options:trickle, rtcp-rsize/xr/fb, fmtp lines,
+    ssrc-msid). ICE credentials, candidates and the sha-256 fingerprint are
+    copied verbatim — those are validated by the DTLS/ICE layers.
+
+    Applied AFTER setLocalDescription, so aiortc's internal state always
+    matches its own offer; only the on-wire text is shaped. Returns "" when
+    the input can't be parsed (caller falls back to the raw aiortc offer).
+    """
+    try:
+        lines = sdp.replace("\r\n", "\n").split("\n")
+        ufrag = pwd = fp = ssrc = ""
+        msid_parts = []
+        candidates = []
+        for line in lines:
+            if line.startswith("a=ice-ufrag:"):
+                ufrag = line.split(":", 1)[1]
+            elif line.startswith("a=ice-pwd:"):
+                pwd = line.split(":", 1)[1]
+            elif line.startswith("a=fingerprint:sha-256 "):
+                fp = line[len("a=fingerprint:sha-256 "):]
+            elif line.startswith("a=ssrc:"):
+                rest = line[len("a=ssrc:"):]
+                ssrc = rest.split(" ", 1)[0]
+            elif line.startswith("a=msid:"):
+                msid_parts = line[len("a=msid:"):].split(" ")
+            elif line.startswith("a=candidate:"):
+                candidates.append(line)
+        if not (ufrag and pwd and fp and ssrc and len(msid_parts) >= 2):
+            return ""
+        import random as _rnd
+        import string as _str
+        sess_id = _rnd.randint(10**18, 10**19 - 1)
+        cname = "".join(_rnd.choice(
+            _str.ascii_letters + _str.digits + "+/") for _ in range(16))
+        out = [
+            "v=0",
+            f"o=- {sess_id} 2 IN IP4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            "a=group:BUNDLE 0",
+            "a=extmap-allow-mixed",
+            f"a=msid-semantic: WMS {msid_parts[0]}",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111 63 9 0 8 13 110 101",
+            "c=IN IP4 0.0.0.0",
+            "a=rtpmap:111 opus/48000/2",
+            "a=fmtp:111 minptime=10;useinbandfec=1",
+            "a=rtpmap:63 red/48000/2",
+            "a=fmtp:63 111/111",
+            "a=rtpmap:9 G722/8000",
+            "a=rtpmap:0 PCMU/8000",
+            "a=rtpmap:8 PCMA/8000",
+            "a=rtpmap:13 CN/8000",
+            "a=rtpmap:110 telephone-event/48000",
+            "a=rtpmap:101 telephone-event/8000",
+            "a=rtcp:9 IN IP4 0.0.0.0",
+            f"a=ice-ufrag:{ufrag}",
+            f"a=ice-pwd:{pwd}",
+            "a=ice-options:trickle",
+            f"a=fingerprint:sha-256 {fp}",
+            "a=setup:actpass",
+            "a=mid:0",
+            "a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level",
+            "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
+            "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+            "a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid",
+            "a=sendrecv",
+            f"a=msid:{msid_parts[0]} {msid_parts[1]}",
+            "a=rtcp-mux",
+            "a=rtcp-rsize",
+            "a=rtcp-xr:rcvr-rtt=all",
+            f"a=ssrc:{ssrc} cname:{cname}",
+            f"a=ssrc:{ssrc} msid:{msid_parts[0]} {msid_parts[1]}",
+            "a=rtcp-fb:111 transport-cc",
+        ]
+        out += candidates
+        out.append("a=end-of-candidates")
+        return "\r\n".join(out) + "\r\n"
+    except Exception as e:
+        logger.warning(f"sip media: Chrome SDP shaping failed: {e}")
+        return ""
 
 
 # RFC 4733 event codes → keypad characters
@@ -327,6 +434,8 @@ if _HAS_AIORTC:
             self._start: Optional[float] = None
             self._timestamp = 0
             self.enabled = True
+            # One increment per recv() == one RTP packet on the wire.
+            self.packets_sent = 0
             # Tapped per transmitted frame (real-time pace) so the call
             # recorder captures what actually went on the wire.
             self.on_frame_sent: Optional[Callable[[bytes], None]] = None
@@ -368,6 +477,7 @@ if _HAS_AIORTC:
                 wait = self._start + (self._timestamp / SAMPLE_RATE) - time.time()
                 if wait > 0:
                     await asyncio.sleep(wait)
+            self.packets_sent += 1
 
             try:
                 payload = self._queue.get_nowait()
@@ -424,6 +534,9 @@ class SipMediaSession:
         self._recv_task: Optional[asyncio.Task] = None
         self._closed = False
         self.state = "new"
+        # Live RTP accounting for the P-RTP-Stat header of our 200 OK to BYE.
+        self._in_pk = 0
+        self._connected_at: Optional[float] = None
 
         self.pc.addTransceiver(self._out_track, direction="sendrecv")
         self._transceiver = self.pc.getTransceivers()[0]
@@ -436,6 +549,8 @@ class SipMediaSession:
         @self.pc.on("connectionstatechange")
         async def _on_state():
             self.state = self.pc.connectionState
+            if self.state == "connected" and self._connected_at is None:
+                self._connected_at = time.time()
             if self.on_state:
                 try:
                     self.on_state(self.state)
@@ -458,6 +573,9 @@ class SipMediaSession:
         # aiortc trickles nothing by default — localDescription is complete
         # once ICE gathering finishes.
         sdp = self.pc.localDescription.sdp
+        shaped = _chrome_shaped_offer(sdp)
+        if shaped:
+            sdp = shaped
         logger.info(
             f"sip media: offer ready "
             f"(local candidates={sdp.count('a=candidate')})")
@@ -612,6 +730,7 @@ class SipMediaSession:
             while not self._closed:
                 frame = await track.recv()
                 frames += 1
+                self._in_pk += 1
                 if started is None:
                     started = time.time()
                 samples_total += int(getattr(frame, "samples", 0) or 0)
@@ -675,6 +794,20 @@ class SipMediaSession:
             logger.debug(f"sip media reader ended: {e}")
 
     # ── lifecycle ──
+
+    def rtp_stat(self) -> str:
+        """P-RTP-Stat value for our 200 OK to BYE (captured web client sends
+        'PS=…, OS=…, PR=…, OR=…, PL=0, JI=0, LA=…, DU=…, NP=1').
+
+        Packet counts are real (one per sent recv() / received frame); the
+        octet figures approximate an opus payload of ~35 bytes/packet —
+        Google only displays these, it never validates them.
+        """
+        ps = self._out_track.packets_sent
+        pr = self._in_pk
+        du = int(time.time() - self._connected_at) if self._connected_at else 0
+        return (f"PS={ps}, OS={ps * 35}, PR={pr}, OR={pr * 38}, "
+                f"PL=0, JI=0, LA=0, DU={du}, NP=1")
 
     async def close(self):
         self._closed = True
