@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import random
 import re
 import string
@@ -49,6 +50,39 @@ ALLOW = "INVITE,ACK,CANCEL,BYE,UPDATE,MESSAGE,OPTIONS,REFER,INFO,PRACK"
 KEEPALIVE_INTERVAL = 150          # server asks keep=240; stay well below
 REGISTER_REFRESH_MARGIN = 300     # re-register this many seconds before expiry
 SESSION_REFRESH_DIV = 2           # refresh session timer at expires/2
+
+# One compact INFO line per SIP message on the wire (investigating the
+# "BYE: ACK not received" storm — need to see whether 200 OK ever arrives
+# and what exactly our ACK looks like). Disable with SIP_TRACE=0.
+_TRACE = os.getenv("SIP_TRACE", "1").strip().lower() not in ("0", "no", "off")
+
+
+def _trace_line(direction: str, msg: "SipMessage") -> str:
+    if msg.is_request:
+        first = f"{msg.method} {msg.uri[:60]}"
+    else:
+        first = f"{msg.status_code} {msg.reason}".strip()
+        if msg.method:
+            first += f" ({msg.method})"
+    cseq = msg.header("CSeq") or "-"
+    call_id = (msg.header("Call-ID") or "-")[:24]
+    via = msg.header("Via") or ""
+    m = re.search(r"branch=([^;\s]+)", via)
+    branch = m.group(1) if m else "-"
+    to = msg.header("To") or ""
+    m = re.search(r";tag=([^;>\s]+)", to)
+    to_tag = m.group(1) if m else "-"
+    extra = ""
+    if msg.is_request and msg.method in ("BYE", "CANCEL"):
+        extra = f" reason={msg.header('Reason') or ''!r}"
+    elif not msg.is_request and msg.method == "INVITE" and msg.status_code >= 200:
+        extra = (f" contact={'Y' if msg.header('Contact') else 'N'}"
+                 f" rr={len(msg.headers_all('Record-Route'))}"
+                 f" rseq={msg.header('RSeq') or '-'}")
+    elif msg.is_request and msg.method == "ACK":
+        extra = f" routes={len(msg.headers_all('Route'))}"
+    return (f"{direction} {first} | id={call_id} cseq={cseq} "
+            f"br={branch} totag={to_tag}{extra}")
 
 
 class SipError(Exception):
@@ -199,6 +233,11 @@ class GVWebPhone:
     def registered(self) -> bool:
         return self._is_registered and not self._closed
 
+    @staticmethod
+    def _trace(direction: str, msg: "SipMessage"):
+        if _TRACE:
+            log.info("sip-trace %s", _trace_line(direction, msg))
+
     @property
     def _local_uri(self) -> str:
         # JsSIP percent-encodes the user part: base64 '=' shows up as %3D on
@@ -216,6 +255,7 @@ class GVWebPhone:
         ))
         data = msg.to_bytes()
         log.debug("SIP C→S\n%s", data.decode(errors="replace"))
+        self._trace("C→S", msg)
         await self._ws.send(data)
         return branch
 
@@ -294,6 +334,7 @@ class GVWebPhone:
                     log.warning("unparseable SIP frame: %r", data[:200])
                     continue
                 log.debug("SIP S→C\n%s", data)
+                self._trace("S→C", msg)
                 await self._dispatch(msg)
         except asyncio.CancelledError:
             pass
@@ -731,6 +772,7 @@ class GVWebPhone:
             resp.body = body
         data = resp.to_bytes()
         log.debug("SIP C→S\n%s", data.decode(errors="replace"))
+        self._trace("C→S", resp)
         await self._ws.send(data)
 
     # ── DTMF (SIP INFO path; RTP telephone-event is the primary path) ──
