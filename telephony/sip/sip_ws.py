@@ -234,7 +234,7 @@ class GVWebPhone:
     @staticmethod
     def _trace(direction: str, msg: "SipMessage"):
         if _TRACE:
-            log.info("sip-trace %s", _trace_line(direction, msg))
+            log.info("sip-trace {}", _trace_line(direction, msg))
 
     @property
     def _local_uri(self) -> str:
@@ -252,7 +252,7 @@ class GVWebPhone:
             f"SIP/2.0/wss {self._via_host};branch={branch};keep",
         ))
         data = msg.to_bytes()
-        log.debug("SIP C→S\n%s", data.decode(errors="replace"))
+        log.debug("SIP C→S\n{}", data.decode(errors="replace"))
         self._trace("C→S", msg)
         await self._ws.send(data)
         return branch
@@ -329,15 +329,15 @@ class GVWebPhone:
                 try:
                     msg = SipMessage.parse(data)
                 except Exception:
-                    log.warning("unparseable SIP frame: %r", data[:200])
+                    log.warning("unparseable SIP frame: {!r}", data[:200])
                     continue
-                log.debug("SIP S→C\n%s", data)
+                log.debug("SIP S→C\n{}", data)
                 self._trace("S→C", msg)
                 await self._dispatch(msg)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.warning("SIP reader ended: %s", e)
+            log.warning("SIP reader ended: {}", e)
             self._is_registered = False
             self._emit("transport_lost", {"error": str(e)})
 
@@ -349,7 +349,7 @@ class GVWebPhone:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.warning("keepalive failed: %s", e)
+            log.warning("keepalive failed: {}", e)
 
     async def _dispatch(self, msg: SipMessage):
         if not msg.is_request:
@@ -428,7 +428,7 @@ class GVWebPhone:
                 try:
                     await self.register()
                 except Exception as e:
-                    log.warning("re-REGISTER failed: %s", e)
+                    log.warning("re-REGISTER failed: {}", e)
                     self._emit("register_failed", {"error": str(e)})
                     await asyncio.sleep(30)
         except asyncio.CancelledError:
@@ -566,7 +566,7 @@ class GVWebPhone:
                 msg.header("CSeq"),
                 d.invite_branch if d else None)
         # responses to in-dialog requests we sent (BYE/UPDATE/CANCEL/PRACK w/o track)
-        log.debug("unmatched response %s %s", msg.status_code, msg.method)
+        log.debug("unmatched response {} {}", msg.status_code, msg.method)
 
     async def _handle_provisional(self, msg: SipMessage):
         d = self.dialog
@@ -633,9 +633,9 @@ class GVWebPhone:
         msg.headers.append(("RAck", f"{rseq} {invite_cseq} INVITE"))
         try:
             resp = await self._request(msg, timeout=15)
-            log.info("PRACK rseq=%s -> %s", rseq, resp.status_code)
+            log.info("PRACK rseq={} -> {}", rseq, resp.status_code)
         except Exception as e:
-            log.warning("PRACK rseq=%s failed: %s", rseq, e)
+            log.warning("PRACK rseq={} failed: {}", rseq, e)
             self._emit("prack_failed", {"rseq": rseq, "error": str(e)})
 
     async def _send_ack(self, d: Dialog):
@@ -647,7 +647,7 @@ class GVWebPhone:
         msg = self._dialog_request("ACK", increment=False,
                                    cseq_override=d.invite_cseq or d.cseq)
         await self._send(msg)
-        log.info("sip ACK sent for INVITE (cseq=%s call-id=%s)",
+        log.info("sip ACK sent for INVITE (cseq={} call-id={})",
                  d.invite_cseq or d.cseq, d.call_id)
 
     def _dialog_request(self, method: str, increment: bool = True,
@@ -698,7 +698,7 @@ class GVWebPhone:
                         ("Session-Expires", f"{d.session_expires};refresher=uac"))
                     await self._request(msg, timeout=15)
                 except Exception as e:
-                    log.warning("session refresh failed: %s", e)
+                    log.warning("session refresh failed: {}", e)
                     self._emit("session_refresh_failed", {"error": str(e)})
                     return
         except asyncio.CancelledError:
@@ -731,7 +731,7 @@ class GVWebPhone:
                 try:
                     answer = self.sdp_answerer(msg.body)
                 except Exception as e:
-                    log.warning("sdp_answerer failed: %s", e)
+                    log.warning("sdp_answerer failed: {}", e)
                     await self._respond(msg, 488, "Not Acceptable Here")
                     return
                 await self._respond(msg, 200, "OK", body=answer,
@@ -769,7 +769,7 @@ class GVWebPhone:
             resp.headers.append(("Content-Type", content_type))
             resp.body = body
         data = resp.to_bytes()
-        log.debug("SIP C→S\n%s", data.decode(errors="replace"))
+        log.debug("SIP C→S\n{}", data.decode(errors="replace"))
         self._trace("C→S", resp)
         await self._ws.send(data)
 
