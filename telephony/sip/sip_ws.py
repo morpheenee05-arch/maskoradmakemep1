@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 import os
 import random
 import re
@@ -29,9 +28,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from loguru import logger as log
 from websockets.asyncio.client import connect as ws_connect
-
-log = logging.getLogger(__name__)
 
 WSS_URL = "wss://web.voice.telephony.goog/websocket"
 WSS_ORIGIN = "https://voice.google.com"
