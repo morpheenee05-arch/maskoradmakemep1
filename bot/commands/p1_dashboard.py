@@ -240,9 +240,11 @@ def _format_overview_view(
             medal = _MEDALS[i] if i < len(_MEDALS) else f"{i + 1}."
             hot = st.get("counts", {}).get("1", 0)
             hot_bit = f" · 🔴{hot}" if hot else ""
+            ice = st.get("cooling", 0)
+            ice_bit = f" · 🧊{ice}" if ice else ""
             lines.append(
                 f"{medal} <code>{_esc(aid)}</code>  "
-                f"<b>{d}</b> ({share:.0f}%) · ⚡ {rate:.1f}/min{hot_bit}"
+                f"<b>{d}</b> ({share:.0f}%) · ⚡ {rate:.1f}/min{hot_bit}{ice_bit}"
             )
         if len(ranked) >= 2:
             fastest = max(ranked, key=lambda x: x[2])
@@ -278,6 +280,8 @@ def _format_servers_view(
         mini_bar = _progress_bar(d, max_done, width=10)
         ac = st.get("counts", {})
         extras = []
+        if st.get("cooling"):
+            extras.append(f"🧊:{st['cooling']}")
         for key in ("1", "2", "voicemail", "hangup", "timeout", "not_answered", "failed"):
             if ac.get(key):
                 short = {"1": "🔴1", "2": "🟢2"}.get(key, _LABEL.get(key, key))

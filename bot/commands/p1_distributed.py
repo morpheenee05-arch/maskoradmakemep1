@@ -127,6 +127,10 @@ async def _p1_result_loop(bot, bus, state: dict):
                         res = r.get("result")
                         phone = r.get("phone", "")
                         record_progress(session, aid, res, phone)
+                        if r.get("cooling") is not None:
+                            _st = session.get("agents", {}).get(aid)
+                            if _st is not None:
+                                _st["cooling"] = r["cooling"]
                         state["done"] = session["done"]
                         last_progress_at = time.time()
                         changed = True

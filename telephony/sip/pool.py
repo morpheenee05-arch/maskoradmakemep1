@@ -131,6 +131,14 @@ class SipPool:
         """p1_runner uses len(pool.workers) as the campaign task count."""
         return self._slots
 
+    def cooling_count(self) -> int:
+        """Slots currently parked on the post-throttle cooldown."""
+        now = time.time()
+        return sum(
+            1 for c in self._slots
+            if (getattr(c, "_cooldown_until", 0) or 0) > now
+        )
+
     def _reclaim_orphaned(self, client, worker_id: int, why: str):
         sid = getattr(client, "_slot_id", None)
         if sid is None:
@@ -174,6 +182,21 @@ class SipPool:
                 logger.warning(
                     f"sip {getattr(client, '_tag', '?')}: account's Chrome "
                     f"is not live — parking this slot for the rest of the run"
+                )
+                continue
+            cool_until = getattr(client, "_cooldown_until", 0) or 0
+            now = time.time()
+            if cool_until > now:
+                # The account hit Google's throttle intercept on its last
+                # call — hold the slot OUT of the free queue until the
+                # cooldown expires, then let it dial again.
+                remaining = cool_until - now
+                logger.info(
+                    f"sip {getattr(client, '_tag', '?')}: cooling "
+                    f"({remaining:.0f}s left) — slot parked"
+                )
+                asyncio.get_running_loop().call_later(
+                    remaining, self._free.put_nowait, client
                 )
                 continue
             sid = client._slot_id

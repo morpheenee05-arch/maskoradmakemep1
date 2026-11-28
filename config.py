@@ -259,6 +259,11 @@ SIP_STREAMS_PER_ACCOUNT = _get_int_env("GV_SIP_STREAMS_PER_ACCOUNT", 1)
 # (observed: 'DTLS handshake failed (connection error)' on start bursts).
 P1_START_STAGGER_MS = _get_int_env("GV_P1_START_STAGGER_MS", 250)
 P1_RECORD_MAX_MB = _get_int_env("GV_P1_RECORD_MAX_MB", 3)
+# Cooldown (seconds) for an account whose call hit Google's "unusual calling
+# activity" throttle intercept. The SIP slot is parked for this long before
+# dialing again — the throttle behaves like a rate limiter, so resting the
+# account lets the bucket refill instead of burning numbers into the wall.
+SIP_THROTTLE_COOLDOWN_SEC = _get_int_env("GV_SIP_THROTTLE_COOLDOWN_SEC", 60)
 CALL_RECORD_DIR = os.getenv("GV_CALL_RECORD_DIR", "").strip()
 # Cache credentials on the agent so a restart can sign in without the operator.
 # WARNING: this writes Google passwords to disk in plain text (mode 0600).

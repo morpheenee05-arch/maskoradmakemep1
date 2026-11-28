@@ -478,11 +478,23 @@ async def _execute_one_body(
             )
         elif result == "unusual_activity":
             # Google's outbound-abuse THROTTLE intercept ("unusual calling
-            # activity") — the account is not burned, it needs a rest.
+            # activity") — the account is not burned, it needs a rest. The
+            # throttle behaves like a rate limiter: park this account's slot
+            # for a cooldown so the bucket refills instead of burning the
+            # next numbers into the same wall.
             _diag_set(
                 why="gv_throttle_intercept",
                 elapsed_s=round(time.monotonic() - t0, 1),
             )
+            try:
+                cd = max(10, int(getattr(config, "SIP_THROTTLE_COOLDOWN_SEC", 60)))
+                gv_client._cooldown_until = time.time() + cd
+                logger.info(
+                    f"p1: {_mask_phone(phone)} throttled — account "
+                    f"{getattr(gv_client, '_tag', '?')} cooling down {cd}s"
+                )
+            except Exception:
+                pass
 
         await _safe_hangup(gv_client, call_id)
         await _ensure_ready(gv_client, "p1 cleanup")

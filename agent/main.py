@@ -1367,6 +1367,14 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
             "job_id": job_id, "run_id": run_id, "agent_id": aid,
             "kind": "p1_progress", "phone": phone, "result": result,
         }
+        try:
+            # Slots parked on the post-throttle cooldown right now — the
+            # controller dashboard shows this as 🧊N next to the agent line.
+            msg["cooling"] = (
+                pool.cooling_count() if hasattr(pool, "cooling_count") else 0
+            )
+        except Exception:
+            pass
         # Attach per-call diagnostics (stage/why/elapsed/stop flag, plus the
         # SIP signaling trace for no-answers) so the controller log shows
         # exactly WHY a call ended the way it did.

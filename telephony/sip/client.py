@@ -103,6 +103,10 @@ class SipPhoneClient:
         self._phone: Optional[GVWebPhone] = None
         self._reg_lock = asyncio.Lock()
         self._cred_ts = 0.0
+        # Epoch until which this account rests after a Google throttle
+        # intercept ("unusual calling activity"). SipPool.acquire parks the
+        # slot while this is in the future.
+        self._cooldown_until = 0.0
 
         # call state (updated from the event loop; read sync from executor)
         self._state = "idle"          # idle | calling | active | ended | failed
