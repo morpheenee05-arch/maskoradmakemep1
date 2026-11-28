@@ -145,12 +145,17 @@ async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, _, inline = action.strip().partition(" ")
         remainder = (inline + "\n" + remainder).strip()
     action = action.strip().lower() or "status"
+    if action not in ("status", "on", "off", "clear", "set"):
+        # Convenience: "/proxy <list…>" without the "set" keyword — when the
+        # argument is proxy lines, it IS the list.
+        action, remainder = "set", arg
 
     proxies = []
     if action == "set":
-        raw_lines = [
-            l.strip() for l in remainder.replace(",", "\n").splitlines()
-        ]
+        raw_lines = []
+        for chunk in remainder.replace(",", "\n").splitlines():
+            # tolerate space-separated proxies on one line too
+            raw_lines.extend(chunk.split())
         proxies = [l for l in raw_lines if l and not l.startswith("#")]
         if not proxies:
             await _send_html(msg, "⚠️ Empty list.\n\n" + _USAGE)
@@ -168,9 +173,6 @@ async def proxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + "\n".join(bad) + "\n\n" + _USAGE,
             )
             return
-    elif action not in ("status", "on", "off", "clear"):
-        await _send_html(msg, _USAGE)
-        return
 
     bus = context.bot_data.get("bus")
     if bus is None:
