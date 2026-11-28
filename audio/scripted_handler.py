@@ -74,6 +74,20 @@ BANNED_INTERCEPT_PHRASES = (
     "unable to complete your call",
 )
 
+# Google outbound-abuse THROTTLE intercept: "We are unable to complete your
+# call due to unusual calling activity. Please try again later." This is NOT
+# a ban — the account is fine, it has just placed too many calls in a
+# window and needs a rest (it recovers on its own). Detected unconditionally
+# (pure classification — nothing gets wiped), so the operator can tell
+# "Google is throttling this account" apart from a real burn and from a
+# callee-side hangup. Historically this exact audio was mislabeled
+# 'account_banned' by BANNED_INTERCEPT_PHRASES ("unable to complete your
+# call") and wiped healthy accounts — that match now resolves here first.
+THROTTLE_INTERCEPT_PHRASES = (
+    "unusual calling activity",
+    "unable to complete your call",
+)
+
 # Extra VM phrase heuristics and spoken-digit normalization.
 VM_STRONG_PHRASES = {
     "leave your message",
@@ -595,6 +609,9 @@ class ScriptedCallHandler:
         if self._result == "account_banned":
             logger.info("🚫 Account-banned intercept during intro — hanging up")
             return "account_banned"
+        if self._result == "unusual_activity":
+            logger.info("⚠️ Throttle intercept during intro — hanging up")
+            return "unusual_activity"
 
         # ── Response Gate #1 ──
         if self._result is None:
@@ -638,6 +655,9 @@ class ScriptedCallHandler:
             # hang up so the account can be quarantined at once.
             logger.info("🚫 Account-banned intercept — skipping follow-up, hanging up")
             return "account_banned"
+        if self._result == "unusual_activity":
+            logger.info("⚠️ Throttle intercept — skipping follow-up, hanging up")
+            return "unusual_activity"
         if self._result == "voicemail":
             # Voicemail confirmed during the gates — do not play the
             # no_response message into a mailbox (saves ~12s per call).
@@ -1063,6 +1083,22 @@ class ScriptedCallHandler:
         else:
             self._stt_interim_count += 1
             logger.debug(f"STT (interim): '{transcript}'")
+            return
+
+        # Google throttle intercept ("unusual calling activity") — checked
+        # BEFORE voicemail scoring (the audio contains VM keywords like
+        # "unable") and BEFORE the banned check: it is a rest signal, not a
+        # burn. Always on — detection only, no quarantine anywhere.
+        if any(p in transcript for p in THROTTLE_INTERCEPT_PHRASES):
+            try:
+                self.audio.flush_output()
+            except Exception:
+                pass
+            self._set_result(
+                "unusual_activity",
+                f"⚠️ GV THROTTLE intercept heard (account needs a rest, "
+                f"NOT banned): '{transcript}'",
+            )
             return
 
         # Google account-restricted intercept — checked BEFORE voicemail

@@ -476,6 +476,13 @@ async def _execute_one_body(
                 why="gv_banned_intercept",
                 elapsed_s=round(time.monotonic() - t0, 1),
             )
+        elif result == "unusual_activity":
+            # Google's outbound-abuse THROTTLE intercept ("unusual calling
+            # activity") — the account is not burned, it needs a rest.
+            _diag_set(
+                why="gv_throttle_intercept",
+                elapsed_s=round(time.monotonic() - t0, 1),
+            )
 
         await _safe_hangup(gv_client, call_id)
         await _ensure_ready(gv_client, "p1 cleanup")

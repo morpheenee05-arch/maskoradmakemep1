@@ -1317,7 +1317,8 @@ async def _handle_p1_job(pool, bus, job: dict, stop_event: asyncio.Event, on_pro
         # SIP signaling trace for no-answers) so the controller log shows
         # exactly WHY a call ended the way it did.
         if result in ("cancelled", "failed", "timeout", "not_answered",
-                      "declined", "invalid_number", "busy", "account_banned"):
+                      "declined", "invalid_number", "busy", "account_banned",
+                      "unusual_activity"):
             try:
                 from telephony.p1_runner import get_last_diag
                 d = get_last_diag()
