@@ -36,6 +36,8 @@ from typing import Callable, Optional
 from loguru import logger as log
 from websockets.asyncio.client import connect as ws_connect
 
+from .proxy_config import mask_proxy
+
 WSS_URL = "wss://web.voice.telephony.goog/websocket"
 WSS_ORIGIN = "https://voice.google.com"
 USER_AGENT_SIP = "GoogleVoice voice.web-frontend_20261104.07_p4/Birdsong v2.2.74"
@@ -228,10 +230,14 @@ class GVWebPhone:
     """One Google Voice web-phone registration; at most one active call."""
 
     def __init__(self, creds, on_event: Optional[EventCallback] = None,
-                 place_call_context: str = ""):
+                 place_call_context: str = "", proxy: Optional[str] = None):
         self.creds = creds
         self.on_event = on_event or (lambda kind, info: None)
         self.place_call_context = place_call_context   # X-GV-PlaceCallContext jspb
+        # Signaling proxy (normalized URL from proxy_config) — the WSS
+        # connection carries the account identity, so it is what anti-abuse
+        # clusters by IP. Media (SRTP/UDP) still goes direct, like Chrome's.
+        self._proxy = proxy
 
         # Birdsong-style stable identities for the registration
         self._via_host = f"{_via_host_token()}.invalid"
@@ -339,14 +345,18 @@ class GVWebPhone:
     # ── connection ──
 
     async def connect(self):
-        self._ws = await ws_connect(
-            WSS_URL,
+        kwargs = dict(
             subprotocols=["sip"],
             origin=WSS_ORIGIN,
             additional_headers={"User-Agent": BROWSER_UA},
             ping_interval=None,            # we do SIP-level CRLF keepalive
             max_size=1 << 20,
         )
+        if self._proxy:
+            # websockets>=15: http(s) CONNECT natively, socks* via python-socks.
+            kwargs["proxy"] = self._proxy
+            log.info("sip ws: signaling via proxy {}", mask_proxy(self._proxy))
+        self._ws = await ws_connect(WSS_URL, **kwargs)
         self._reader_task = asyncio.create_task(self._reader())
         self._keepalive_task = asyncio.create_task(self._keepalive())
 

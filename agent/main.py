@@ -170,6 +170,60 @@ async def _handle_logs_job(bus, job: dict):
     logger.info(f"[job {job_id}] logs tail sent ({note or err})")
 
 
+async def _handle_proxies_job(bus, job: dict):
+    """Apply/report per-worker SIP proxy routing (bot /proxy command).
+
+    One proxy per worker (worker_id=i → proxies[i]); applies to NEW SIP
+    registrations — sockets already registered keep their current route until
+    re-register (~1h) or the next campaign's prewarm.
+    """
+    from telephony.sip import proxy_config
+
+    job_id = job.get("job_id")
+    aid = config.AGENT_ID
+    params = job.get("params") or {}
+    action = str(params.get("action") or "status").strip().lower()
+    err = None
+    try:
+        if action == "set":
+            ok, bad = proxy_config.set_proxies(params.get("proxies") or [])
+            if bad:
+                err = "rejected: " + "; ".join(
+                    f"{raw!r} ({why})" for raw, why in bad[:5]
+                )
+            # Setting a fresh list implies the operator wants proxy mode on.
+            proxy_config.save_state(True, ok)
+        elif action == "on":
+            st = proxy_config.load_state()
+            proxy_config.save_state(True, st["proxies"])
+        elif action == "off":
+            st = proxy_config.load_state()
+            proxy_config.save_state(False, st["proxies"])
+        elif action == "clear":
+            proxy_config.save_state(False, [])
+    except Exception as e:
+        logger.exception(f"[job {job_id}] proxies apply failed")
+        err = (err + "; " if err else "") + str(e)
+
+    status = proxy_config.status_report(
+        len(getattr(config, "WORKER_POOL", []) or [])
+    )
+    if status["enabled"] and status["missing"]:
+        logger.warning(
+            f"sip proxy: only {status['count']} proxy(ies) for "
+            f"{status['workers']} worker(s) — {status['missing']} worker(s) "
+            f"will go DIRECT"
+        )
+    logger.info(
+        f"[job {job_id}] proxies: enabled={status['enabled']} "
+        f"count={status['count']} workers={status['workers']}"
+    )
+    await bus.publish_result({
+        "job_id": job_id, "agent_id": aid, "kind": "proxies",
+        "status": status, "error": err,
+    })
+
+
 async def _handle_wipe_history_job(pool, bus, job: dict):
     """Send this agent's local wipe archive (text; optional named/latest photo)."""
     from telephony import wipe_archive
@@ -1874,6 +1928,8 @@ async def run_agent():
                         await _handle_wipe_history_job(pool, bus, job)
                     elif jtype == "logs":
                         await _handle_logs_job(bus, job)
+                    elif jtype == "proxies":
+                        await _handle_proxies_job(bus, job)
                     elif jtype == "login":
                         # A pending pool re-init would respawn Chrome right on
                         # top of the sign-in we are about to run — cancel it.
@@ -2102,6 +2158,23 @@ async def run_agent():
                         await _hard_p1_stop("watchdog_p1_timeout")
             except Exception as e:
                 logger.debug(f"Watchdog p1 check error: {e}")
+
+    try:
+        from telephony.sip import proxy_config as _proxy_cfg
+        _pst = _proxy_cfg.status_report(
+            len(getattr(config, "WORKER_POOL", []) or [])
+        )
+        if _pst["enabled"]:
+            _warn = (
+                f" — WARNING: {_pst['missing']} worker(s) have no proxy "
+                f"and will go DIRECT" if _pst["missing"] else ""
+            )
+            logger.info(
+                f"SIP proxy mode ON: {_pst['count']} proxy(ies) for "
+                f"{_pst['workers']} worker(s){_warn}"
+            )
+    except Exception:
+        pass
 
     job_task = asyncio.create_task(job_loop(), name="agent_job_loop")
     wd_task = asyncio.create_task(watchdog_loop(), name="agent_watchdog")

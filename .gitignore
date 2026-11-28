@@ -81,6 +81,7 @@ tools/scripts/
 
 # Per-agent SIP device-id store (keyed by account email) and browser probe dumps
 .sip_device_ids.json
+.sip_proxies.json
 tools/gv_probe_out/
 
 # local capture dumps (contain live session cookies)

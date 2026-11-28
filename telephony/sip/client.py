@@ -28,6 +28,7 @@ from loguru import logger
 from .audio_bridge import SipAudioManager
 from .gv_auth import VoiceAPIClient, random_client_id, sip_register_info_body
 from .media import SipMediaSession, AiortcMissingError
+from .proxy_config import mask_proxy, proxy_for_worker
 from .sip_ws import GVWebPhone, SipError
 
 REREGISTER_MARGIN = 300
@@ -131,6 +132,12 @@ class SipPhoneClient:
         flat = {k: (v.get("value", "") if isinstance(v, dict) else v)
                 for k, v in cookies.items()}
         api = VoiceAPIClient(flat)
+        proxy = getattr(self, "_proxy_url", None)
+        if proxy:
+            # The mint POST is authenticated with the account's cookies, so it
+            # must exit through the same IP as the signaling WebSocket —
+            # otherwise Google sees one account from two IPs at once.
+            api.session.proxies.update({"http": proxy, "https": proxy})
         # Stable per-account sipDeviceId — the web dialer reuses ONE id for
         # the account's whole life; a new random id per mint is what burns it.
         cid = persistent_client_id(self.account_email or f"worker{self.worker_id}")
@@ -140,8 +147,13 @@ class SipPhoneClient:
         async with self._reg_lock:
             if self._phone is not None and self._phone.registered:
                 return
+            # Resolved per registration, so /proxy changes apply without a
+            # pool rebuild; a dead proxy fails loudly here, never falls back
+            # to the agent IP silently.
+            proxy = proxy_for_worker(self.worker_id)
+            self._proxy_url = proxy
             creds = await asyncio.to_thread(self._mint_creds)
-            phone = GVWebPhone(creds, on_event=self._on_sip_event)
+            phone = GVWebPhone(creds, on_event=self._on_sip_event, proxy=proxy)
             await asyncio.wait_for(phone.connect(), timeout=20)
             try:
                 await asyncio.wait_for(phone.register(), timeout=30)
@@ -155,7 +167,8 @@ class SipPhoneClient:
                     pass
             self._phone = phone
             self._cred_ts = time.time()
-            logger.info(f"sip {self._tag}: registered")
+            via = f" via proxy {mask_proxy(proxy)}" if proxy else " (direct)"
+            logger.info(f"sip {self._tag}: registered{via}")
 
     async def _drop_registration(self, why: str):
         logger.warning(f"sip {self._tag}: dropping registration ({why})")

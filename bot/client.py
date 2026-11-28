@@ -131,6 +131,7 @@ def register_handlers(application: Application):
     from bot.commands.p1_hangups import register_p1_hangups_handlers
     from bot.commands.accounts import register_accounts_handlers
     from bot.commands.wipes import register_wipes_handlers
+    from bot.commands.proxy import register_proxy_handlers
 
     register_call_handlers(application)
     register_menu_handlers(application)
@@ -142,5 +143,6 @@ def register_handlers(application: Application):
     register_p1_hangups_handlers(application)
     register_accounts_handlers(application)
     register_wipes_handlers(application)
+    register_proxy_handlers(application)
 
     logger.info("All Telegram handlers registered")
