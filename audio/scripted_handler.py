@@ -1067,7 +1067,8 @@ class ScriptedCallHandler:
 
         # Google account-restricted intercept — checked BEFORE voicemail
         # scoring: this is our own burned GV account talking, not a mailbox.
-        if any(p in transcript for p in BANNED_INTERCEPT_PHRASES):
+        if config.BAN_DETECTION_ENABLED and any(
+                p in transcript for p in BANNED_INTERCEPT_PHRASES):
             try:
                 self.audio.flush_output()
             except Exception:

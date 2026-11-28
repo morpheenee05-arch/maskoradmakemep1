@@ -1128,6 +1128,8 @@ async def _recheck_hangup_audio(rec_path):
     """
     if not rec_path:
         return None, ""
+    if not config.BAN_DETECTION_ENABLED:
+        return None, ""
     try:
         from infra.dg_keys import get_pool, looks_like_auth_error
         from audio.scripted_handler import BANNED_INTERCEPT_PHRASES

@@ -419,6 +419,9 @@ def is_voice_ban_page(url: str, text: str = "") -> bool:
     Missing dialer, missing number, chrome:// NTP, DNS interstitial, and
     the workspace marketing page are NOT a ban.
     """
+    import config
+    if not config.BAN_DETECTION_ENABLED:
+        return False
     u = (url or "").lower()
     if "support.google.com" in u:
         if any(m in u for m in BAN_URL_MARKERS):
@@ -1310,8 +1313,11 @@ class GoogleSignIn:
 
     def error_outcome(self) -> Optional[tuple]:
         """(outcome, detail) when Google rejected our input, else None."""
+        import config
         text = self.page_text()
         for outcome, markers in ERROR_MARKERS:
+            if outcome == DISABLED and not config.BAN_DETECTION_ENABLED:
+                continue
             for m in markers:
                 if m in text:
                     return outcome, m

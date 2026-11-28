@@ -1827,6 +1827,8 @@ class PhoneClient:
 
     def check_ban_status(self) -> tuple:
         """Check if GV account is banned. Returns (is_banned, reason)."""
+        if not config.BAN_DETECTION_ENABLED:
+            return False, None
         if not self.driver:
             return False, None
         try:

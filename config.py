@@ -266,6 +266,15 @@ GV_SAVE_CREDENTIALS = os.getenv("GV_SAVE_CREDENTIALS", "0").strip().lower() not 
     "0", "false", "no", "off", ""
 )
 
+# TEMP: account-ban detection is DISABLED — it fired false positives and the
+# operator verifies bans by hand for now. Gates every ban surface: login-page
+# ban URLs/text (gv_login), the pre-call check_ban_status probe, the in-call
+# banned-intercept STT phrases and the hangup audio recheck. Set
+# GV_BAN_DETECTION=1 (or flip this default back to "1") to re-enable.
+BAN_DETECTION_ENABLED = os.getenv("GV_BAN_DETECTION", "0").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
+
 # Set GV_HEADLESS=0 (or false/no) in .env to launch VISIBLE Chrome windows
 # for debugging — you can then watch what each profile does during a call.
 GV_HEADLESS = os.getenv("GV_HEADLESS", "1").strip().lower() not in (
